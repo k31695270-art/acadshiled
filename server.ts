@@ -1,6 +1,7 @@
 import express from 'express';
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
+import http from 'node:http';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -15,6 +16,16 @@ const rateBuckets = new Map<string, number[]>();
 function isRateLimited(ip: string): boolean {
   const now = Date.now();
   const cutoff = now - RATE_LIMIT_WINDOW_MS;
+  if (rateBuckets.size > 512) {
+    for (const [key, list] of rateBuckets.entries()) {
+      const fresh = list.filter((ts) => ts >= cutoff);
+      if (fresh.length === 0) {
+        rateBuckets.delete(key);
+      } else {
+        rateBuckets.set(key, fresh);
+      }
+    }
+  }
   const timestamps = (rateBuckets.get(ip) ?? []).filter((ts) => ts >= cutoff);
   if (timestamps.length >= RATE_LIMIT_MAX) {
     rateBuckets.set(ip, timestamps);
@@ -61,6 +72,14 @@ function runPythonBridge<T>(payload: Record<string, unknown>): Promise<T> {
 
 async function createApp() {
   const app = express();
+  app.disable('x-powered-by');
+  app.use((_req, res, next) => {
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('X-Frame-Options', 'DENY');
+    res.setHeader('Referrer-Policy', 'no-referrer');
+    res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
+    next();
+  });
   app.use(express.json({ limit: '128kb' }));
 
   app.get('/api/health', (_req, res) => {
@@ -78,6 +97,7 @@ async function createApp() {
 
     const rawText = typeof req.body?.text === 'string' ? req.body.text : '';
     const rawUrl = typeof req.body?.url === 'string' ? req.body.url : null;
+    const useAuxiliaryLlm = Boolean(req.body?.use_auxiliary_llm);
     const trimmed = rawText.trim().slice(0, 5000);
 
     if (!trimmed) {
@@ -90,10 +110,10 @@ async function createApp() {
         action: 'analyze',
         text: trimmed,
         url: rawUrl,
+        use_auxiliary_llm: useAuxiliaryLlm,
       });
       res.json(result);
-    } catch (err) {
-      console.error('Analyze error:', err);
+    } catch {
       res.status(500).json({ detail: 'Analysis failed' });
     }
   });
@@ -140,6 +160,7 @@ async function createApp() {
     }
 
     const rawUrl = typeof req.body?.url === 'string' ? req.body.url.trim().slice(0, 2000) : '';
+    const includeIntel = req.body?.include_intel !== false;
     if (rawUrl.length < 3) {
       res.status(400).json({ detail: 'Valid URL is required' });
       return;
@@ -149,11 +170,38 @@ async function createApp() {
       const result = await runPythonBridge({
         action: 'inspect_url',
         url: rawUrl,
+        include_intel: includeIntel,
+      });
+      res.json(result);
+    } catch {
+      res.status(500).json({ detail: 'URL inspection failed' });
+    }
+  });
+
+  app.post('/api/sandbox-url', async (req, res) => {
+    const clientIp = req.ip || req.socket.remoteAddress || 'unknown';
+    if (isRateLimited(clientIp)) {
+      res.status(429).json({
+        detail: 'تم تجاوز الحد المسموح من الطلبات. يرجى المحاولة بعد دقيقة.',
+      });
+      return;
+    }
+
+    const rawUrl = typeof req.body?.url === 'string' ? req.body.url.trim().slice(0, 2000) : '';
+    if (rawUrl.length < 3) {
+      res.status(400).json({ detail: 'Valid URL is required' });
+      return;
+    }
+
+    try {
+      const result = await runPythonBridge({
+        action: 'sandbox_url',
+        url: rawUrl,
       });
       res.json(result);
     } catch (err) {
-      console.error('URL inspect error:', err);
-      res.status(500).json({ detail: 'URL inspection failed' });
+      console.error('URL sandbox error:', err);
+      res.status(500).json({ detail: 'URL sandbox detonation failed' });
     }
   });
 
@@ -383,6 +431,13 @@ async function createApp() {
   });
 
   app.post('/api/report', async (req, res) => {
+    const clientIp = req.ip || req.socket.remoteAddress || 'unknown';
+    if (isRateLimited(clientIp)) {
+      res.status(429).json({
+        detail: 'تم تجاوز الحد المسموح من الطلبات. يرجى المحاولة بعد دقيقة.',
+      });
+      return;
+    }
     const category = typeof req.body?.category === 'string' ? req.body.category : 'other';
     const score = Number(req.body?.score ?? 0);
     const fingerprint =
@@ -401,8 +456,7 @@ async function createApp() {
         fingerprint,
       });
       res.json(result);
-    } catch (err) {
-      console.error('Report error:', err);
+    } catch {
       res.status(500).json({ detail: 'Failed to save report' });
     }
   });
@@ -411,12 +465,28 @@ async function createApp() {
     try {
       const result = await runPythonBridge({ action: 'trending' });
       res.json(result);
-    } catch (err) {
-      console.error('Trending error:', err);
+    } catch {
       res.status(500).json({ detail: 'Failed to load trending scams' });
     }
   });
 
+  app.get('/api/evaluation', async (req, res) => {
+    const clientIp = req.ip || req.socket.remoteAddress || 'unknown';
+    if (isRateLimited(clientIp)) {
+      res.status(429).json({
+        detail: 'تم تجاوز الحد المسموح من الطلبات. يرجى المحاولة بعد دقيقة.',
+      });
+      return;
+    }
+    try {
+      const result = await runPythonBridge({ action: 'evaluate' });
+      res.json(result);
+    } catch {
+      res.status(500).json({ detail: 'Failed to run model evaluation' });
+    }
+  });
+
+  const httpServer = http.createServer(app);
   const distDir = path.join(__dirname, 'dist');
   const isProd = process.env.NODE_ENV === 'production' && fs.existsSync(distDir);
 
@@ -425,8 +495,9 @@ async function createApp() {
     const vite = await createViteServer({
       server: {
         middlewareMode: true,
-        hmr: process.env.DISABLE_HMR !== 'true',
-        watch: process.env.DISABLE_HMR === 'true' ? null : {},
+        hmr: false,
+        ws: { server: httpServer },
+        watch: null,
       },
       appType: 'spa',
     });
@@ -438,7 +509,7 @@ async function createApp() {
     });
   }
 
-  app.listen(PORT, '0.0.0.0', () => {
+  httpServer.listen(PORT, '0.0.0.0', () => {
     console.log(`Kashf server listening on http://0.0.0.0:${PORT}`);
   });
 }

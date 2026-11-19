@@ -40,6 +40,7 @@ export interface TranslationBundle {
       single: string;
       batch: string;
       urlInspector: string;
+      sandbox: string;
       academic: string;
       dlp: string;
       history: string;
@@ -97,6 +98,17 @@ export interface TranslationBundle {
     tlsLabel: string;
     redirectsLabel: string;
     finalUrlLabel: string;
+    openSandboxButton: string;
+    urlClassifications: Record<'malicious' | 'suspicious' | 'no_known_threat' | 'unknown', string>;
+    noKnownThreatNote: string;
+    threatIntelTitle: string;
+    threatStatusLabels: Record<'hit' | 'clean' | 'not_configured' | 'unavailable' | 'error', string>;
+    rdapLabel: string;
+    dnsRecordsLabel: string;
+    technicalDetailsTitle: string;
+    suspiciousSegmentsTitle: string;
+    linksVerifyTitle: string;
+    scriptsLabel: string;
   };
   batch: {
     title: string;
@@ -121,6 +133,41 @@ export interface TranslationBundle {
     inspectButton: string;
     inspectingButton: string;
     emptyError: string;
+  };
+  urlSandbox: {
+    title: string;
+    subtitle: string;
+    isolationNotice: string;
+    inputLabel: string;
+    placeholder: string;
+    runButton: string;
+    runningButton: string;
+    emptyError: string;
+    presetPhishLabel: string;
+    presetApkLabel: string;
+    presetSafeLabel: string;
+    modeLabels: {
+      live_captured: string;
+      simulated_offline: string;
+      blocked_ssrf: string;
+      blocked_unsafe_scheme: string;
+    };
+    whatTitle: string;
+    observedTag: string;
+    predictedTag: string;
+    previewTitle: string;
+    previewSubtitle: string;
+    previewEmptyText: string;
+    previewTrapWarning: string;
+    telemetryTitle: string;
+    httpStatusLabel: string;
+    contentTypeLabel: string;
+    formsLabel: string;
+    scriptsLabel: string;
+    iframesLabel: string;
+    cookiesLabel: string;
+    redirectsTitle: string;
+    guaranteesLabel: string;
   };
   history: {
     title: string;
@@ -363,6 +410,7 @@ export const i18n: Record<Language, TranslationBundle> = {
         single: 'فحص رسالة',
         batch: 'فحص متعدد',
         urlInspector: 'تشريح رابط',
+        sandbox: 'Sandbox الآمن',
         academic: 'حصانة الأكاديمية',
         dlp: 'فحص التسريب والملفات',
         history: 'السجل المحلي',
@@ -455,12 +503,34 @@ export const i18n: Record<Language, TranslationBundle> = {
       brandMatchLabel: 'العلامة المرتبطة',
       officialDomainLabel: 'نطاق رسمي موثق',
       impersonationLabel: 'اشتباه انتحال علامة',
-      liveProbeButton: 'فحص حي بالبايثون (DNS + SSL + مسار التحويل)',
+      liveProbeButton: 'فحص حي بالبايثون (Threat Intel + RDAP + DNS + SSL)',
       liveProbingButton: 'جارِ الفحص الشبكي...',
       dnsLabel: 'سجل DNS / IP',
       tlsLabel: 'شهادة SSL / TLS',
       redirectsLabel: 'سلسلة إعادة التوجيه',
       finalUrlLabel: 'الوجهة النهائية',
+      openSandboxButton: 'اختبار الرابط في Sandbox الآمن',
+      urlClassifications: {
+        malicious: 'خبيث (Malicious)',
+        suspicious: 'مشبوه (Suspicious)',
+        no_known_threat: 'لا يوجد تهديد معروف (No Known Threat ≠ آمن 100%)',
+        unknown: 'غير معروف / بيانات غير كافية (Unknown)',
+      },
+      noKnownThreatNote: 'عدم وجود تطابق في القوائم المفحوصة لا يثبت أمان الرابط تماماً؛ التزم الحذر وتحقق من السياق.',
+      threatIntelTitle: 'مصادر استخبارات التهديدات (Threat Intelligence Sources)',
+      threatStatusLabels: {
+        hit: 'تم رصد تهديد',
+        clean: 'غير مدرج بالقائمة',
+        not_configured: 'غير مُهيّأ (بدون مفتاح)',
+        unavailable: 'غير متاح مؤقتاً',
+        error: 'خطأ في الاستعلام',
+      },
+      rdapLabel: 'عمر النطاق (RDAP)',
+      dnsRecordsLabel: 'سجلات DNS (A / MX / TXT)',
+      technicalDetailsTitle: 'التفاصيل التقنية العميقة (DNS · RDAP · TLS · Unicode)',
+      suspiciousSegmentsTitle: 'الجمل والمقاطع المشبوهة المستخرجة',
+      linksVerifyTitle: 'روابط تتطلب فحصاً منفصلاً في قواعد التهديدات',
+      scriptsLabel: 'أبجديات النطاق (Unicode Scripts)',
     },
     batch: {
       title: 'فحص الدفعات وسجلات الدردشة',
@@ -486,6 +556,43 @@ export const i18n: Record<Language, TranslationBundle> = {
       inspectButton: 'تشريح وفحص حي',
       inspectingButton: 'جارِ التشريح الشبكي...',
       emptyError: 'يرجى إدخال رابط صالح للفحص.',
+    },
+    urlSandbox: {
+      title: 'صندوق الرمل الآمن لاختبار الروابط المشبوهة (Safe URL Sandbox)',
+      subtitle:
+        'جرّب أي رابط مشبوه أو مختصر داخل بيئة بايثون معزولة تماماً لتشاهد ماذا سيفعل الرابط لو قمت بفتحه، دون أي خطر على جهازك أو حساباتك.',
+      isolationNotice:
+        'بيئة معزولة 100%: تنفيذ JavaScript معطل · صفر كوكيز · صفر تنزيلات على القرص · حظر الشبكة الداخلية (SSRF)',
+      inputLabel: 'أدخل الرابط المشبوه لتجربته بأمان',
+      placeholder: 'http://paypa1-secure.xyz/login?otp=required أو https://example.com',
+      runButton: 'تشغيل الرابط داخل Sandbox الآمن',
+      runningButton: 'جارِ العزل والتحليل...',
+      emptyError: 'يرجى إدخال رابط لتشغيله داخل صندوق الرمل.',
+      presetPhishLabel: 'رابط تصيّد (PayPal)',
+      presetApkLabel: 'رابط تحميل خبيث (.apk)',
+      presetSafeLabel: 'موقع آمن (example.com)',
+      modeLabels: {
+        live_captured: 'التقاط شبكي حي معزول (Live HTTP Capture)',
+        simulated_offline: 'محاكاة سلوكية آمنة (النطاق غير متصل)',
+        blocked_ssrf: 'تم الحظر تلقائياً (هدف شبكة داخلية SSRF)',
+        blocked_unsafe_scheme: 'تم الحظر فوراً (مخطط تنفيذ كود خطر)',
+      },
+      whatTitle: 'ماذا سيفعل هذا الرابط لو قمت بتشغيله على جهازك؟',
+      observedTag: 'مرصود فعلياً',
+      predictedTag: 'سلوك متوقع',
+      previewTitle: 'معاينة معزولة لمحتوى الصفحة (Zero-Execution View)',
+      previewSubtitle: 'عرض نصي وبنيوي صامت لما يحاول الرابط إظهاره دون تحميل صور أو تنفيذ أكواد.',
+      previewEmptyText: 'لم يُرجع الخادم محتوى نصياً مرئياً أو تعذر الوصول للنطاق.',
+      previewTrapWarning: 'حقول حساسة يحاول الرابط طلبها منك:',
+      telemetryTitle: 'القياس الجنائي للخادم والـ DOM',
+      httpStatusLabel: 'حالة HTTP',
+      contentTypeLabel: 'نوع المحتوى',
+      formsLabel: 'النماذج / حقول السر',
+      scriptsLabel: 'السكربتات / التشويش',
+      iframesLabel: 'إطارات مخفية',
+      cookiesLabel: 'محاولات الكوكيز',
+      redirectsTitle: 'سلسلة التحويلات التي سلكها الرابط:',
+      guaranteesLabel: 'ضمانات الأمان المفعّلة أثناء الفحص:',
     },
     history: {
       title: 'سجل الفحوصات المحلي',
@@ -837,6 +944,7 @@ export const i18n: Record<Language, TranslationBundle> = {
         single: 'Single Message',
         batch: 'Batch Scan',
         urlInspector: 'URL X-Ray',
+        sandbox: 'Safe Sandbox',
         academic: 'Academic Shield',
         dlp: 'DLP & Files',
         history: 'Local History',
@@ -929,12 +1037,34 @@ export const i18n: Record<Language, TranslationBundle> = {
       brandMatchLabel: 'Matched Brand',
       officialDomainLabel: 'Verified Official Domain',
       impersonationLabel: 'Suspected Impersonation',
-      liveProbeButton: 'Run Live Python Probe (DNS + SSL + Redirects)',
+      liveProbeButton: 'Run Live Python Probe (Threat Intel + RDAP + DNS + SSL)',
       liveProbingButton: 'Probing Network...',
       dnsLabel: 'DNS / IP Records',
       tlsLabel: 'SSL / TLS Certificate',
       redirectsLabel: 'Redirect Chain',
       finalUrlLabel: 'Final Destination',
+      openSandboxButton: 'Test in Safe Sandbox',
+      urlClassifications: {
+        malicious: 'Malicious',
+        suspicious: 'Suspicious',
+        no_known_threat: 'No Known Threat (≠ Guaranteed Safe)',
+        unknown: 'Unknown / Insufficient Evidence',
+      },
+      noKnownThreatNote: 'No Known Threat only means no match in checked feeds; it does not prove a URL is 100% safe.',
+      threatIntelTitle: 'Threat Intelligence Sources',
+      threatStatusLabels: {
+        hit: 'Threat Hit',
+        clean: 'No Match',
+        not_configured: 'Not Configured',
+        unavailable: 'Unavailable',
+        error: 'Lookup Error',
+      },
+      rdapLabel: 'Domain Age (RDAP)',
+      dnsRecordsLabel: 'DNS Records (A / MX / TXT)',
+      technicalDetailsTitle: 'Technical Analysis Details (DNS · RDAP · TLS · Unicode)',
+      suspiciousSegmentsTitle: 'Extracted Suspicious Sentences / Segments',
+      linksVerifyTitle: 'Links Requiring Separate Threat-Intel Verification',
+      scriptsLabel: 'Unicode Scripts',
     },
     batch: {
       title: 'Batch & Chat-Log Scanner',
@@ -960,6 +1090,43 @@ export const i18n: Record<Language, TranslationBundle> = {
       inspectButton: 'Inspect & Probe Live',
       inspectingButton: 'Probing Link...',
       emptyError: 'Please enter a valid URL to inspect.',
+    },
+    urlSandbox: {
+      title: 'Isolated Safe URL Sandbox',
+      subtitle:
+        'Safely detonate any suspicious link inside an isolated Python sandbox to inspect what the page would do if opened — without exposing your browser, cookies, or files.',
+      isolationNotice:
+        '100% Isolated: JavaScript Disabled · Zero Cookies Stored · Zero Disk Downloads · SSRF Guard Active',
+      inputLabel: 'Enter suspicious URL to test safely',
+      placeholder: 'http://paypa1-secure.xyz/login?otp=required or https://example.com',
+      runButton: 'Detonate in Safe Sandbox',
+      runningButton: 'Isolating & Analyzing...',
+      emptyError: 'Please enter a URL to run in the safe sandbox.',
+      presetPhishLabel: 'Phishing Trap (PayPal)',
+      presetApkLabel: 'Malicious Download (.apk)',
+      presetSafeLabel: 'Safe Site (example.com)',
+      modeLabels: {
+        live_captured: 'Live Isolated HTTP Capture',
+        simulated_offline: 'Safe Behavioral Simulation (Host Unreachable)',
+        blocked_ssrf: 'Blocked Automatically (Private/Internal IP)',
+        blocked_unsafe_scheme: 'Blocked Immediately (Executable URI Scheme)',
+      },
+      whatTitle: 'What This Link Would Do If Opened',
+      observedTag: 'Observed',
+      predictedTag: 'Predicted',
+      previewTitle: 'Inert Sandbox Preview (Zero-Execution View)',
+      previewSubtitle: 'Passive text and form-field extraction without executing scripts or loading remote media.',
+      previewEmptyText: 'No visible page text returned or host is offline.',
+      previewTrapWarning: 'Sensitive fields this page attempts to collect:',
+      telemetryTitle: 'HTTP & DOM Telemetry',
+      httpStatusLabel: 'HTTP Status',
+      contentTypeLabel: 'Content-Type',
+      formsLabel: 'Forms / Password Inputs',
+      scriptsLabel: 'Scripts / Obfuscated',
+      iframesLabel: 'Hidden Iframes',
+      cookiesLabel: 'Cookie Attempts',
+      redirectsTitle: 'Observed Redirect Path:',
+      guaranteesLabel: 'Active Sandbox Protections:',
     },
     history: {
       title: 'Local Scan History',

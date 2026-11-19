@@ -1,17 +1,30 @@
-"""Pure-Python offline scam and phishing message analyzer."""
+"""Context-aware, evidence-based scam and phishing message analyzer (Arabic/Iraqi/MSA/English)."""
 
 from __future__ import annotations
 
 import hashlib
+import json
+import os
 import re
-from typing import TypedDict
+import urllib.request
+from typing import Any, TypedDict
 from urllib.parse import urlparse
 
 from brands import BRANDS
+from evidence_engine import (
+    EvidenceBundle,
+    EvidenceItem,
+    RiskLevel,
+    build_evidence_bundle,
+    make_evidence,
+    make_limitation,
+    utc_now_iso,
+)
 from url_inspector import (
     SHORTENER_DOMAINS,
     SUSPICIOUS_TLDS,
     UrlForensics,
+    defang_url,
     inspect_url_forensics,
 )
 
@@ -22,7 +35,6 @@ URL_REGEX = re.compile(
 )
 
 IPV4_REGEX = re.compile(r"^(?:\d{1,3}\.){3}\d{1,3}$")
-
 TASHKEEL_OR_ZW_REGEX = re.compile(r"[\u064B-\u065F\u0670\u0640\u200B-\u200D\uFEFF]")
 
 EMOJI_REGEX = re.compile(
@@ -48,15 +60,31 @@ class Reason(TypedDict):
     match: str
 
 
+class SuspiciousSegment(TypedDict):
+    text: str
+    threat_type: str
+    severity: str
+    reason_ar: str
+    reason_en: str
+
+
 class AnalysisResult(TypedDict):
     score: int
     verdict: str
+    risk_level: RiskLevel
     category: str
+    threat_types: list[str]
     reasons: list[Reason]
     highlights: list[str]
+    suspicious_segments: list[SuspiciousSegment]
+    links_requiring_verification: list[dict[str, Any]]
+    recommended_actions: list[dict[str, str]]
+    auxiliary_llm: dict[str, Any]
     fingerprint: str
     urls: list[str]
     url_forensics: list[UrlForensics]
+    evidence_bundle: EvidenceBundle
+    scan_timestamp: str
 
 
 def normalize_arabic_with_map(text: str) -> tuple[str, list[int]]:
@@ -94,35 +122,25 @@ def compute_fingerprint(text: str) -> str:
 
 
 def levenshtein_distance(a: str, b: str) -> int:
-    """Compute Levenshtein edit distance between two strings."""
     if a == b:
         return 0
     if not a:
         return len(b)
     if not b:
         return len(a)
-
     prev_row = list(range(len(b) + 1))
     for i, ch_a in enumerate(a, start=1):
         curr_row = [i]
         for j, ch_b in enumerate(b, start=1):
             cost = 0 if ch_a == ch_b else 1
-            curr_row.append(
-                min(
-                    curr_row[j - 1] + 1,      # insertion
-                    prev_row[j] + 1,          # deletion
-                    prev_row[j - 1] + cost,   # substitution
-                )
-            )
+            curr_row.append(min(curr_row[j - 1] + 1, prev_row[j] + 1, prev_row[j - 1] + cost))
         prev_row = curr_row
     return prev_row[-1]
 
 
 def normalize_brand_token(token: str) -> str:
-    """Normalize domain label for lookalike brand checks."""
     cleaned = token.lower().replace("-", "")
-    cleaned = cleaned.replace("0", "o").replace("1", "l").replace("rn", "m")
-    return cleaned
+    return cleaned.replace("0", "o").replace("1", "l").replace("rn", "m")
 
 
 def extract_urls(text: str, extra_url: str | None = None) -> list[str]:
@@ -145,42 +163,15 @@ def extract_urls(text: str, extra_url: str | None = None) -> list[str]:
     return found
 
 
-def _parse_url_parts(raw_url: str) -> tuple[str, str, str]:
-    """Return (scheme, hostname, path) for a URL string."""
-    candidate = raw_url if re.match(r"^https?://", raw_url, re.IGNORECASE) else f"http://{raw_url}"
-    parsed = urlparse(candidate)
-    host = (parsed.hostname or "").lower()
-    return parsed.scheme.lower(), host, (parsed.path or "").lower()
-
-
-def _is_official_brand_domain(host: str, domains: list[str]) -> bool:
-    for d in domains:
-        d_low = d.lower()
-        if host == d_low or host.endswith(f".{d_low}"):
-            return True
-    return False
-
-
-def _has_mixed_script_or_non_ascii(host: str) -> bool:
-    has_ascii_alpha = any("a" <= ch <= "z" for ch in host)
-    has_non_ascii = any(ord(ch) > 127 for ch in host)
-    if has_non_ascii and has_ascii_alpha:
-        return True
-    if has_non_ascii:
-        return True
-    return False
-
-
 def _match_phrases(
     raw_text: str,
     norm_text: str,
     index_map: list[int],
     phrases: list[str],
 ) -> str | None:
-    """Find first matching phrase using boundary-aware matching and return original substring."""
+    """Find first boundary-aware phrase match and return original substring."""
     for phrase in phrases:
         norm_phrase, _ = normalize_arabic_with_map(phrase)
-        # Allow optional punctuation/whitespace between words in multi-word phrases
         parts = [re.escape(p) for p in norm_phrase.split()]
         if not parts:
             continue
@@ -195,14 +186,97 @@ def _match_phrases(
     return None
 
 
-def analyze_message(text: str, url: str | None = None) -> AnalysisResult:
-    """Analyze a suspicious message and optional URL without any network calls."""
+def _split_sentences(raw_text: str) -> list[str]:
+    parts = re.split(r"(?<=[.!؟?\n])\s+|\n+", raw_text.strip())
+    return [p.strip() for p in parts if p.strip()]
+
+
+def _find_containing_sentence(sentences: list[str], snippet: str) -> str:
+    if not snippet:
+        return sentences[0] if sentences else ""
+    for sent in sentences:
+        if snippet in sent:
+            return sent
+    return snippet
+
+
+def _run_optional_gemini_auxiliary(text: str, timeout: float = 3.5) -> dict[str, Any]:
+    """Optional auxiliary semantic review using GEMINI_API_KEY (never sole verdict source)."""
+    api_key = os.environ.get("GEMINI_API_KEY", "").strip()
+    if not api_key or api_key.startswith("MY_"):
+        return {
+            "used": False,
+            "status": "not_configured",
+            "summary_ar": "المحلل الدلالي المساعد (Gemini) غير مفعّل — يعتمد التحليل على المحرك الحتمي.",
+            "summary_en": "Auxiliary LLM review (Gemini) not configured; deterministic rule & context engine used.",
+        }
+
+    endpoint = (
+        "https://generativelanguage.googleapis.com/v1beta/models/"
+        f"gemini-2.5-flash:generateContent?key={api_key}"
+    )
+    prompt = (
+        "Analyze if this message shows social engineering or BEC/phishing cues. "
+        "Respond strictly in JSON with keys: cue_detected (boolean), reason_ar (string), reason_en (string). "
+        f"Message:\n{text[:1200]}"
+    )
+    body = json.dumps(
+        {
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {"temperature": 0.1, "responseMimeType": "application/json"},
+        }
+    ).encode("utf-8")
+    req = urllib.request.Request(
+        endpoint,
+        data=body,
+        method="POST",
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = json.loads(resp.read(65536).decode("utf-8", errors="replace"))
+        cand_text = (
+            raw.get("candidates", [{}])[0]
+            .get("content", {})
+            .get("parts", [{}])[0]
+            .get("text", "")
+        )
+        parsed = json.loads(cand_text) if cand_text else {}
+        return {
+            "used": True,
+            "status": "ok",
+            "cue_detected": bool(parsed.get("cue_detected", False)),
+            "summary_ar": str(parsed.get("reason_ar") or "تمت المراجعة الدلالية المساعدة."),
+            "summary_en": str(parsed.get("reason_en") or "Auxiliary semantic check completed."),
+        }
+    except Exception:
+        return {
+            "used": False,
+            "status": "unavailable",
+            "summary_ar": "تعذر الوصول للمحلل الدلالي المساعد (مهلة/شبكة).",
+            "summary_en": "Auxiliary Gemini check unavailable or timed out.",
+        }
+
+
+def analyze_message(
+    text: str,
+    url: str | None = None,
+    *,
+    use_auxiliary_llm: bool = False,
+) -> AnalysisResult:
+    """Context-aware analysis of SMS/WhatsApp/email text and embedded URLs."""
+    scan_ts = utc_now_iso()
     raw_text = (text or "")[:5000]
     urls = extract_urls(raw_text, url)
     norm_text, index_map = normalize_arabic_with_map(raw_text)
+    sentences = _split_sentences(raw_text)
 
     reasons: list[Reason] = []
     highlights: list[str] = []
+    evidence: list[EvidenceItem] = []
+    suspicious_segments: list[SuspiciousSegment] = []
+    threat_types: list[str] = []
+
     category_points: dict[str, int] = {
         "phishing_bank": 0,
         "fake_prize": 0,
@@ -222,6 +296,9 @@ def analyze_message(text: str, url: str | None = None) -> AnalysisResult:
         detail_en: str,
         match: str,
         category_key: str,
+        threat_type: str,
+        severity: str = "medium",
+        source: str = "phishing_context_engine",
     ) -> None:
         reasons.append(
             {
@@ -235,274 +312,210 @@ def analyze_message(text: str, url: str | None = None) -> AnalysisResult:
             }
         )
         category_points[category_key] = category_points.get(category_key, 0) + points
+        if threat_type not in threat_types:
+            threat_types.append(threat_type)
         if match and match in raw_text and match not in highlights:
             highlights.append(match)
+        evidence.append(
+            make_evidence(
+                evidence_id=rule_id,
+                category=threat_type,
+                severity=severity,  # type: ignore[arg-type]
+                title_ar=title_ar,
+                title_en=title_en,
+                detail_ar=detail_ar,
+                detail_en=detail_en,
+                source=source,
+                observed_value=match[:120],
+                timestamp=scan_ts,
+            )
+        )
+        seg_text = _find_containing_sentence(sentences, match)
+        if seg_text and not any(s["text"] == seg_text and s["threat_type"] == threat_type for s in suspicious_segments):
+            suspicious_segments.append(
+                {
+                    "text": seg_text,
+                    "threat_type": threat_type,
+                    "severity": severity,
+                    "reason_ar": detail_ar,
+                    "reason_en": detail_en,
+                }
+            )
 
-    # Track triggered rule flags so each URL rule triggers at most once (highest severity match)
+    # --- 1. Inspect URLs with upgraded url_inspector ---
+    url_forensics = [inspect_url_forensics(u) for u in urls]
     url_rule_flags: set[str] = set()
+    has_risky_url = False
 
-    for raw_url in urls:
-        scheme, host, path = _parse_url_parts(raw_url)
-        if not host:
-            continue
+    for uf in url_forensics:
+        raw_url = uf["original_url"]
+        if uf["matched_brand"] and not uf["is_official_brand"] and "brand_impersonation" not in url_rule_flags:
+            url_rule_flags.add("brand_impersonation")
+            has_risky_url = True
+            add_reason(
+                "brand_impersonation",
+                35,
+                f"انتحال علامة معروفة في الرابط ({uf['matched_brand']})",
+                f"Brand impersonation in URL ({uf['matched_brand']})",
+                f"الرابط يقلّد أو يضمّن اسم {uf['matched_brand']} على نطاق غير رسمي.",
+                f"URL mimics or embeds {uf['matched_brand']} on an unofficial domain.",
+                raw_url,
+                "phishing_bank",
+                "fake_authority_impersonation",
+                severity="high",
+                source="url_static_forensics",
+            )
+        if uf["is_ip"] and "raw_ip_url" not in url_rule_flags:
+            url_rule_flags.add("raw_ip_url")
+            has_risky_url = True
+            add_reason(
+                "raw_ip_url",
+                25,
+                "الرابط يستخدم عنوان IP مباشر بدل اسم نطاق",
+                "Raw IP address used instead of domain",
+                "الخدمات الشرعية تستخدم نطاقات رسمية بدلاً من أرقام IP.",
+                "Legitimate services do not route login flows through raw IP addresses.",
+                raw_url,
+                "phishing_bank",
+                "suspicious_link",
+                severity="high",
+                source="url_static_forensics",
+            )
+        if (uf["is_mixed_script_homograph"] or uf["has_punycode"]) and "punycode_or_homograph" not in url_rule_flags:
+            url_rule_flags.add("punycode_or_homograph")
+            has_risky_url = True
+            add_reason(
+                "punycode_or_homograph",
+                25,
+                "حروف متشابهة مخادعة (Homograph) أو ترميز Punycode",
+                "Homograph spoofing or Punycode domain",
+                "النطاق يستخدم أحرفاً غير قياسية لخداع القارئ.",
+                "Domain uses Punycode or mixed-script characters to spoof legitimate text.",
+                raw_url,
+                "phishing_bank",
+                "suspicious_link",
+                severity="high",
+                source="url_static_forensics",
+            )
+        if uf["is_shortener"] and "shortened_url" not in url_rule_flags:
+            url_rule_flags.add("shortened_url")
+            has_risky_url = True
+            add_reason(
+                "shortened_url",
+                15,
+                "رابط مختصر يخفي الوجهة الحقيقية",
+                "Shortened URL hides final destination",
+                "تمنع الروابط المختصرة رؤية النطاق الحقيقي قبل فتحها.",
+                "Shortened links obscure destination host until resolved.",
+                raw_url,
+                "other",
+                "suspicious_link",
+                severity="medium",
+                source="url_static_forensics",
+            )
+        if uf["tld"] in SUSPICIOUS_TLDS and "suspicious_tld" not in url_rule_flags:
+            url_rule_flags.add("suspicious_tld")
+            has_risky_url = True
+            add_reason(
+                "suspicious_tld",
+                15,
+                f"امتداد نطاق مرتفع المخاطر ({uf['tld']})",
+                f"High-abuse top-level domain ({uf['tld']})",
+                "الرابط ينتهي بامتداد شائع في حملات التصيّد.",
+                "Domain uses a TLD heavily abused in phishing campaigns.",
+                raw_url,
+                "other",
+                "suspicious_link",
+                severity="medium",
+                source="url_static_forensics",
+            )
+        if (uf["subdomain_depth"] >= 3 or uf["has_at_symbol"]) and "excessive_subdomains_or_at" not in url_rule_flags:
+            url_rule_flags.add("excessive_subdomains_or_at")
+            has_risky_url = True
+            add_reason(
+                "excessive_subdomains_or_at",
+                15,
+                "بنية رابط مضللة بكثرة النطاقات الفرعية أو الرمز @",
+                "Deceptive subdomain depth or '@' syntax",
+                "ترتيب النطاق الفرعي مصمم لإخفاء اسم المضيف الفعلي.",
+                "Excessive subdomains or '@' syntax obscures the true host.",
+                raw_url,
+                "other",
+                "suspicious_link",
+                severity="medium",
+                source="url_static_forensics",
+            )
+        if not uf["is_https"] and uf["scheme"] == "http" and "no_https" not in url_rule_flags:
+            url_rule_flags.add("no_https")
+            add_reason(
+                "no_https",
+                5,
+                "الرابط غير مشفر (HTTP بدون HTTPS)",
+                "Unencrypted HTTP link",
+                "البيانات عبر HTTP غير محمية بالتشفير.",
+                "HTTP links lack transport encryption.",
+                raw_url,
+                "other",
+                "suspicious_link",
+                severity="low",
+                source="url_static_forensics",
+            )
 
-        # 1. Shortened URL (+15)
-        if "shortened_url" not in url_rule_flags:
-            if any(host == s or host.endswith(f".{s}") for s in SHORTENER_DOMAINS):
-                url_rule_flags.add("shortened_url")
-                add_reason(
-                    "shortened_url",
-                    15,
-                    "رابط مختصر يخفي الوجهة الحقيقية",
-                    "Shortened URL hides final destination",
-                    "تُستخدم الروابط المختصرة لإخفاء اسم الموقع الحقيقي ومنعك من التحقق منه قبل النقر.",
-                    "Shortened links conceal the actual destination domain before you click.",
-                    raw_url,
-                    "other",
-                )
+    all_official_urls = bool(url_forensics) and all(uf["is_official_brand"] for uf in url_forensics)
 
-        # 2. Suspicious TLD (+15)
-        if "suspicious_tld" not in url_rule_flags:
-            matched_tld = next((tld for tld in SUSPICIOUS_TLDS if host.endswith(tld)), None)
-            if matched_tld:
-                url_rule_flags.add("suspicious_tld")
-                add_reason(
-                    "suspicious_tld",
-                    15,
-                    f"نطاق إنترنت منخفض الموثوقية ({matched_tld})",
-                    f"High-risk top-level domain ({matched_tld})",
-                    "النطاق ينتهي بامتداد رخيص وشائع بكثرة في مواقع التصيّد والاحتيال.",
-                    "The domain uses a top-level extension frequently abused in phishing campaigns.",
-                    raw_url,
-                    "other",
-                )
-
-        # 3. Raw IP address (+25)
-        if "raw_ip_url" not in url_rule_flags:
-            if IPV4_REGEX.match(host) or ":" in host:
-                url_rule_flags.add("raw_ip_url")
-                add_reason(
-                    "raw_ip_url",
-                    25,
-                    "الرابط يستخدم عنوان IP بدلاً من اسم موقع",
-                    "Raw IP address used instead of domain",
-                    "المواقع الرسمية والبنوك لا تطلب منك تسجيل الدخول عبر أرقام IP مباشرة.",
-                    "Legitimate services use official domain names rather than raw IP addresses.",
-                    raw_url,
-                    "phishing_bank",
-                )
-
-        # 4. Too many subdomains (>3 dots) or '@' inside URL (+15)
-        if "excessive_subdomains_or_at" not in url_rule_flags:
-            if host.count(".") > 3 or "@" in raw_url:
-                url_rule_flags.add("excessive_subdomains_or_at")
-                add_reason(
-                    "excessive_subdomains_or_at",
-                    15,
-                    "بنية رابط مضلّلة أو متعددة النطاقات الفرعية",
-                    "Deceptive URL structure or excessive subdomains",
-                    "الرابط يحتوي على عدد مريب من النطاقات الفرعية أو الرمز @ لخداع القارئ.",
-                    "The URL contains too many subdomains or an '@' symbol designed to mislead.",
-                    raw_url,
-                    "other",
-                )
-
-        # 5. Punycode or mixed-script homograph (+25)
-        if "punycode_or_homograph" not in url_rule_flags:
-            if "xn--" in host or _has_mixed_script_or_non_ascii(host):
-                url_rule_flags.add("punycode_or_homograph")
-                add_reason(
-                    "punycode_or_homograph",
-                    25,
-                    "حروف متشابهة أو ترميز Punycode لخداع البصر",
-                    "Homograph characters or Punycode spoofing",
-                    "النطاق يستخدم حروفاً غير قياسية أو ترميزاً مخادعاً يشبه أسماء مواقع معروفة.",
-                    "The domain uses Punycode or lookalike characters to mimic a legitimate address.",
-                    raw_url,
-                    "phishing_bank",
-                )
-
-        # 6. Brand impersonation (+35 lookalike, +30 brand in subdomain/path)
-        if "brand_impersonation" not in url_rule_flags:
-            labels = [lbl for lbl in host.split(".") if lbl]
-            # Strip TLD (last label) and common ccTLD suffixes for comparison
-            domain_labels = labels[:-1] if len(labels) > 1 else labels
-            main_label = domain_labels[-1] if domain_labels else host
-            subdomain_labels = domain_labels[:-1]
-
-            impersonated_brand: str | None = None
-            impersonation_points = 0
-            impersonation_kind = "lookalike"
-
-            is_shortener_host = any(host == s or host.endswith(f".{s}") for s in SHORTENER_DOMAINS)
-
-            for brand in BRANDS:
-                if _is_official_brand_domain(host, brand["domains"]):
-                    continue
-
-                # Check lookalike distance on main domain label and hyphenated parts (skip known shorteners)
-                main_parts = (
-                    []
-                    if is_shortener_host
-                    else [main_label] + [p for p in main_label.split("-") if len(p) >= 3]
-                )
-                matched_lookalike = False
-                for part in main_parts:
-                    norm_part = normalize_brand_token(part)
-                    for alias in brand["aliases"]:
-                        norm_alias = normalize_brand_token(alias)
-                        if len(norm_alias) < 3:
-                            continue
-                        max_dist = 1 if len(norm_alias) <= 4 else 2
-                        dist = levenshtein_distance(norm_part, norm_alias)
-                        # Distance 0 after 0->o / 1->l / rn->m / hyphen removal means exact lookalike
-                        # Distance 1-2 on raw or normalized label means typosquatting
-                        if dist <= max_dist and part.lower() != alias.lower():
-                            matched_lookalike = True
-                            break
-                        if part.lower() == alias.lower():
-                            # Exact brand word used on a non-official domain (e.g. paypal-login.xyz or paypal.evil.com)
-                            matched_lookalike = True
-                            break
-                    if matched_lookalike:
-                        break
-
-                if matched_lookalike:
-                    impersonated_brand = brand["name"]
-                    impersonation_points = 35
-                    impersonation_kind = "lookalike"
-                    break
-
-                # Check brand name appearing in subdomain or path of unrelated domain
-                sub_joined = " ".join(normalize_brand_token(s) for s in subdomain_labels)
-                path_norm = normalize_brand_token(path)
-                for alias in brand["aliases"]:
-                    norm_alias = normalize_brand_token(alias)
-                    if len(norm_alias) < 3:
-                        continue
-                    if norm_alias in sub_joined or norm_alias in path_norm:
-                        impersonated_brand = brand["name"]
-                        impersonation_points = 30
-                        impersonation_kind = "embedded"
-                        break
-                if impersonated_brand:
-                    break
-
-            if impersonated_brand:
-                url_rule_flags.add("brand_impersonation")
-                if impersonation_kind == "lookalike":
-                    add_reason(
-                        "brand_impersonation",
-                        impersonation_points,
-                        f"انتحال اسم علامة تجارية معروفة ({impersonated_brand})",
-                        f"Impersonating a known brand ({impersonated_brand})",
-                        f"الرابط يقلّد اسم {impersonated_brand} بتغيير حروف متشابهة أو إضافات مضلّلة وليس النطاق الرسمي.",
-                        f"The URL mimics {impersonated_brand} using lookalike characters or deceptive additions.",
-                        raw_url,
-                        "phishing_bank",
-                    )
-                else:
-                    add_reason(
-                        "brand_impersonation",
-                        impersonation_points,
-                        f"استغلال اسم {impersonated_brand} داخل رابط غير رسمي",
-                        f"Brand name ({impersonated_brand}) embedded in unrelated link",
-                        f"اسم {impersonated_brand} مذكور في مسار أو نطاق فرعي لموقع غريب وغير رسمي.",
-                        f"The name {impersonated_brand} appears inside the subdomain or path of an unrelated domain.",
-                        raw_url,
-                        "phishing_bank",
-                    )
-
-        # 7. No HTTPS (+5)
-        if "no_https" not in url_rule_flags:
-            if scheme == "http":
-                url_rule_flags.add("no_https")
-                add_reason(
-                    "no_https",
-                    5,
-                    "الرابط غير مشفّر (HTTP بدلاً من HTTPS)",
-                    "Unencrypted link (HTTP without HTTPS)",
-                    "المواقع الحساسة والبنوك تستخدم دائماً اتصال HTTPS المشفّر لحماية بياناتك.",
-                    "Legitimate login and banking pages always enforce encrypted HTTPS connections.",
-                    raw_url,
-                    "other",
-                )
-
-    # --- Text Rules ---
-    has_urgency = False
-    has_sensitive = False
-
-    # 1. Urgency (+15)
-    urgency_phrases = [
-        "خلال 24 ساعه",
-        "خلال ٢٤ ساعه",
-        "خلال ساعات",
-        "سيتم ايقاف حسابك",
-        "سيتم تعليق حسابك",
-        "سيتم حظر حسابك",
-        "فورا",
-        "عاجل جدا",
-        "اخر تحذير",
-        "تنبيه اخير",
-        "قبل انتهاء المهله",
-        "last warning",
-        "final warning",
-        "act now",
-        "within 24 hours",
-        "immediately",
-        "account suspended",
-        "will be suspended",
-        "urgent action",
+    # --- 2. Context Signals (avoid triggering on benign words in isolation) ---
+    action_lure_phrases = [
+        "اضغط الرابط",
+        "افتح الرابط",
+        "انقر هنا",
+        "ادخل الرابط",
+        "سجل عبر",
+        "سجل بالرابط",
+        "حدث بياناتك",
+        "اكد معلوماتك",
+        "تحديث بيانات",
+        "تحديث الحساب",
+        "دزلي",
+        "ارسل الرمز",
+        "click the link",
+        "click here",
+        "open the link",
+        "verify via",
+        "update your account",
+        "confirm your details",
+        "fill out the form",
+        "submit below",
     ]
-    urgency_match = _match_phrases(raw_text, norm_text, index_map, urgency_phrases)
-    if urgency_match:
-        has_urgency = True
-        add_reason(
-            "urgency",
-            15,
-            "أسلوب استعجال وضغط لاتخاذ قرار سريع",
-            "Artificial urgency and pressure tactics",
-            "المحتالون يهددون بإغلاق الحساب أو انتهاء المهلة لمنعك من التفكير والتحقق.",
-            "Scammers create artificial urgency or threaten suspension so you act before verifying.",
-            urgency_match,
-            "other",
-        )
+    action_match = _match_phrases(raw_text, norm_text, index_map, action_lure_phrases)
+    has_action_or_link = bool(urls or action_match)
 
-    # 2. Prize or reward (+25)
-    prize_phrases = [
-        "مبروك ربحت",
-        "مبروك فزت",
-        "لقد ربحت",
-        "ربحت جائزه",
-        "ربحت",
-        "جائزه نقديه",
-        "جائزه ماليه",
-        "جائزه",
-        "دخلت السحب",
-        "فائز في السحب",
-        "سحب عشوائي",
-        "سحب على",
-        "you won",
-        "you have won",
-        "congratulations you won",
-        "claim your prize",
-        "cash prize",
-        "lucky winner",
+    # Benign institutional / public notice markers (e.g. university seminar, official award news)
+    benign_context_phrases = [
+        "الدخول مجاني",
+        "الحضور مجاني",
+        "مجاناً للطلبة",
+        "مجانا للطلبة",
+        "ندوة علمية",
+        "ورشة عمل",
+        "قاعة المؤتمرات",
+        "اجتماع القسم",
+        "التفوق العلمي",
+        "جائزة التفوق",
+        "حصلت الطالبة",
+        "حصل الطالب",
+        "بريد الجامعة الرسمي",
+        "البريد الرسمي للشركة",
+        "free admission",
+        "free entry",
+        "academic award",
+        "meeting reminder",
+        "conference room",
+        "monthly report",
     ]
-    prize_match = _match_phrases(raw_text, norm_text, index_map, prize_phrases)
-    if prize_match:
-        add_reason(
-            "prize_reward",
-            25,
-            "إغراء بجائزة مالية أو سحب وهمي",
-            "Fake prize or lottery lure",
-            "الرسائل التي تخبرك بفوزك بجائزة أو سحب لم تشارك به هي وسيلة شائعة لسرقة البيانات.",
-            "Unsolicited messages claiming you won a cash prize or draw are classic phishing lures.",
-            prize_match,
-            "fake_prize",
-        )
+    has_benign_context = bool(_match_phrases(raw_text, norm_text, index_map, benign_context_phrases))
 
-    # 3. Requests for sensitive data (+35)
+    # --- 3. Text Threat Rules (Context-Sensitive) ---
+    # A. Sensitive Credential / OTP Theft (+35) — always strong risk (MSA + Iraqi dialect + English)
     sensitive_phrases = [
         "otp",
         "cvv",
@@ -511,6 +524,11 @@ def analyze_message(text: str, url: str | None = None) -> AnalysisResult:
         "كود التحقق",
         "رمز التاكيد",
         "كود التفعيل",
+        "دزلي الرمز",
+        "دز الرمز",
+        "دز الكود",
+        "ارسل الرمز",
+        "وصلتك رسالة بيها رقم",
         "كلمه المرور",
         "كلمه السر",
         "الرقم السري",
@@ -518,28 +536,32 @@ def analyze_message(text: str, url: str | None = None) -> AnalysisResult:
         "بيانات البطاقه",
         "معلومات البطاقه",
         "تاريخ الانتهاء",
+        "بيانات الدخول",
         "verification code",
         "password",
         "passcode",
         "card number",
         "security code",
         "one time password",
+        "login credentials",
     ]
     sensitive_match = _match_phrases(raw_text, norm_text, index_map, sensitive_phrases)
+    has_sensitive = bool(sensitive_match)
     if sensitive_match:
-        has_sensitive = True
         add_reason(
             "sensitive_data",
             35,
-            "طلب رموز تحقق أو بيانات بنكية حساسة",
-            "Request for OTP or sensitive credentials",
-            "أي جهة رسمية أو مصرفية لن تطلب منك أبداً إرسال رمز التحقق OTP أو كلمة المرور أو رقم البطاقة.",
-            "No legitimate bank or service will ever ask for your OTP code, password, or CVV.",
+            "طلب رموز تحقق أو كلمات مرور أو بيانات بطاقة حساسة",
+            "Request for OTP, password, or payment credentials",
+            "المصارف والجهات الرسمية لا تطلب أبداً إرسال رمز OTP أو كلمة المرور أو بيانات البطاقة.",
+            "Banks and legitimate services never ask users to share OTPs, passwords, or CVV codes.",
             sensitive_match,
             "otp_theft",
+            "otp_credential_theft",
+            severity="critical",
         )
 
-    # 4. Asks to transfer money or buy gift cards (+25)
+    # B. Money Transfer / Gift Card / Fee Demand (+25)
     transfer_phrases = [
         "تحويل مبلغ",
         "حول مبلغ",
@@ -552,6 +574,8 @@ def analyze_message(text: str, url: str | None = None) -> AnalysisResult:
         "كارت رصيد",
         "ارسل رصيد",
         "حواله ماليه",
+        "غيرنا حساب التحويل",
+        "تغيير رقم الحساب البنكي",
         "transfer money",
         "wire transfer",
         "send money",
@@ -559,21 +583,135 @@ def analyze_message(text: str, url: str | None = None) -> AnalysisResult:
         "gift cards",
         "itunes card",
         "steam card",
+        "routing changed",
+        "updated bank account",
     ]
     transfer_match = _match_phrases(raw_text, norm_text, index_map, transfer_phrases)
     if transfer_match:
         add_reason(
             "money_transfer_giftcard",
             25,
-            "طلب تحويل أموال أو شراء بطاقات شحن وهدايا",
-            "Request for money transfer or gift cards",
-            "طلب إرسال مبالغ مالية أو بطاقات رصيد وهدايا غير قابلة للاسترداد علامة واضحة على الاحتيال.",
-            "Asking for wire transfers, mobile credit, or non-refundable gift cards is a common scam sign.",
+            "طلب تحويل أموال أو دفع رسوم أو تغيير حساب الدفع",
+            "Request for money transfer, upfront fee, or changed payment routing",
+            "طلبات التحويل العاجلة أو بطاقات الهدايا أو تغيير الحساب المصرفي من سمات الاحتيال المالي.",
+            "Urgent wire transfers, gift cards, or sudden payment routing changes indicate financial fraud.",
             transfer_match,
             "phishing_bank",
+            "financial_fraud",
+            severity="high",
         )
 
-    # 5. Fake delivery or customs fee (+20)
+    # C. Urgency & Coercive Threat Tactics (+15 ONLY when threatening suspension OR paired with link/action/sensitive ask)
+    coercive_urgency_phrases = [
+        "سيتم ايقاف حسابك",
+        "سيتم تعليق حسابك",
+        "سيتم حظر حسابك",
+        "حسابك راح ينسد",
+        "حسابك سينغلق",
+        "اخر تحذير",
+        "تنبيه اخير",
+        "قبل انتهاء المهله",
+        "account suspended",
+        "will be suspended",
+        "final warning",
+        "last warning",
+        "your account will be locked",
+    ]
+    soft_urgency_phrases = [
+        "خلال 24 ساعه",
+        "خلال ٢٤ ساعه",
+        "خلال ساعات",
+        "فورا",
+        "عاجل جدا",
+        "عاجل",
+        "act now",
+        "within 24 hours",
+        "immediately",
+        "urgent action",
+        "before end of day",
+    ]
+    coercive_match = _match_phrases(raw_text, norm_text, index_map, coercive_urgency_phrases)
+    soft_urg_match = _match_phrases(raw_text, norm_text, index_map, soft_urgency_phrases)
+    has_urgency = False
+    if coercive_match:
+        has_urgency = True
+        add_reason(
+            "urgency",
+            20,
+            "تهديد بإيقاف الحساب وضغط زمني للتحايل على التحقق",
+            "Account suspension threat and pressure tactic",
+            "التهديد بإغلاق الحساب يهدف لخلق ذعر يمنعك من التحقق عبر القنوات الرسمية.",
+            "Threatening imminent account suspension pressures victims into skipping verification.",
+            coercive_match,
+            "other",
+            "urgency_pressure",
+            severity="high",
+        )
+    elif soft_urg_match and (has_risky_url or has_sensitive or bool(transfer_match) or (bool(action_match) and not all_official_urls and not has_benign_context)):
+        has_urgency = True
+        add_reason(
+            "urgency",
+            15,
+            "استعجال مقترن بدعوة لإجراء أو رابط غير موثوق",
+            "Urgency paired with call-to-action or untrusted link",
+            "الاستعجال بحد ذاته ليس دليلاً، لكنه مقترن هنا بدعوة فورية أو رابط يستوجب الحذر.",
+            "Urgency alone is benign, but here it is paired with an immediate link or action demand.",
+            soft_urg_match,
+            "other",
+            "urgency_pressure",
+            severity="medium",
+        )
+
+    # D. Fake Prize / Free Offer Lure — context-aware! ("مبروك ربحت 5000$" + link/claim vs "جائزة التفوق العلمي")
+    direct_prize_scam_phrases = [
+        "مبروك ربحت",
+        "مبروك فزت",
+        "لقد ربحت",
+        "دخلت السحب",
+        "فائز في السحب",
+        "سحب عشوائي",
+        "لاستلام الجائزه",
+        "استلم جائزتك",
+        "منحه ماليه فوريه",
+        "عرض مجاني محدود",
+        "you won",
+        "you have won",
+        "congratulations you won",
+        "claim your prize",
+        "lucky winner",
+        "selected as a winner",
+    ]
+    weak_prize_words = ["ربحت", "جائزه", "جائزه نقديه", "جائزه ماليه", "مجاني", "مجانا", "cash prize", "free gift"]
+    direct_prize_match = _match_phrases(raw_text, norm_text, index_map, direct_prize_scam_phrases)
+    weak_prize_match = _match_phrases(raw_text, norm_text, index_map, weak_prize_words)
+    if direct_prize_match and not has_benign_context:
+        add_reason(
+            "prize_reward",
+            25,
+            "إغراء بجائزة مالية أو سحب غير مبرر",
+            "Unsolicited prize or lottery lure",
+            "الادعاء بالفوز بجائزة أو سحب عشوائي وطلب التفاعل عبر رابط هو نمط احتيالي شائع.",
+            "Unsolicited cash prize or raffle win claims are classic social engineering lures.",
+            direct_prize_match,
+            "fake_prize",
+            "fake_offer_prize",
+            severity="high",
+        )
+    elif weak_prize_match and not has_benign_context and (has_risky_url or has_sensitive or bool(transfer_match) or bool(action_match)):
+        add_reason(
+            "prize_reward",
+            20,
+            "إغراء بمكافأة أو عرض مجاني مقترن برابط أو طلب إجراء",
+            "Prize/free offer lure paired with link or action demand",
+            "تم اقتران ذكر الجائزة أو العرض المجاني بدعوة ضغط رابط أو تقديم بيانات.",
+            "Prize or free-offer language is paired with a suspicious action or link.",
+            weak_prize_match,
+            "fake_prize",
+            "fake_offer_prize",
+            severity="medium",
+        )
+
+    # E. Fake Delivery / Customs Fee (+20)
     delivery_phrases = [
         "طردك",
         "شحنتك",
@@ -591,24 +729,25 @@ def analyze_message(text: str, url: str | None = None) -> AnalysisResult:
         "unable to deliver",
     ]
     delivery_match = _match_phrases(raw_text, norm_text, index_map, delivery_phrases)
-    if delivery_match:
+    if delivery_match and (has_action_or_link or bool(transfer_match)):
         add_reason(
             "fake_delivery",
             20,
-            "ادعاء وجود طرد معلق أو رسوم جمركية للتوصيل",
-            "Fake delivery notification or customs fee",
-            "رسائل تعذّر التسليم والرسوم الجمركية البسيطة تُستخدم لسرقة بيانات بطاقتك المصرفية.",
-            "Fake parcel delivery notices and small customs fee requests are used to steal card details.",
+            "ادعاء طرد معلق أو رسوم شحن/جمارك مع رابط أو طلب دفع",
+            "Delivery or customs fee claim paired with link/payment",
+            "رسائل تعذّر التسليم ورسوم الجمارك الصغيرة تُستخدم لسرقة بيانات الدفع.",
+            "Fake delivery holds and micro customs fees are commonly used for card harvesting.",
             delivery_match,
             "fake_delivery",
+            "social_engineering",
+            severity="medium",
         )
 
-    # 6. Fake job offer with fee or guaranteed daily profit investment (+25)
+    # F. Fake Job / Guaranteed Investment / Fake Gov Grant (+25)
     job_phrases = [
         "رسوم تسجيل للوظيفه",
         "رسوم توظيف",
-        "وظيفه براتب",
-        "فرصه عمل من المنزل",
+        "تعيين فوري",
         "العمل من المنزل براتب",
         "توظيف فوري",
         "job fee",
@@ -629,32 +768,56 @@ def analyze_message(text: str, url: str | None = None) -> AnalysisResult:
         "guaranteed profit",
         "double your money",
     ]
-    job_match = _match_phrases(raw_text, norm_text, index_map, job_phrases)
     invest_match = _match_phrases(raw_text, norm_text, index_map, investment_phrases)
+    job_match = _match_phrases(raw_text, norm_text, index_map, job_phrases)
     if invest_match:
         add_reason(
             "fake_job_investment",
             25,
-            "وعد بأرباح يومية مضمونة أو استثمار وهمي",
+            "وعد بأرباح مضمونة أو مضاعفة رأس المال",
             "Guaranteed profit or investment fraud lure",
-            "لا يوجد استثمار شرعي يضمن أرباحاً يومية ثابتة أو مضاعفة سريعة للأموال.",
-            "No legitimate investment guarantees fixed daily returns or risk-free profits.",
+            "لا يوجد استثمار حقيقي يضمن أرباحاً يومية ثابتة أو خالية من المخاطر.",
+            "No legitimate investment guarantees daily fixed returns.",
             invest_match,
             "investment_fraud",
+            "financial_fraud",
+            severity="high",
         )
     elif job_match:
         add_reason(
             "fake_job_investment",
             25,
-            "عرض عمل وهمي يطلب رسوماً أو يَعِد براتب غير منطقي",
-            "Fake job offer or upfront employment fee",
-            "جهات التوظيف الحقيقية لا تطلب رسوم تسجيل أو عمولات مسبقة من المتقدمين.",
-            "Legitimate employers never ask candidates to pay upfront registration or hiring fees.",
+            "عرض توظيف مشبوه يطلب رسوماً أو يعد بربح غير واقعي",
+            "Suspicious employment lure or upfront job fee",
+            "جهات التوظيف الموثوقة لا تطلب رسوم تسجيل مسبقة.",
+            "Legitimate employers do not charge upfront hiring or registration fees.",
             job_match,
             "fake_job",
+            "financial_fraud",
+            severity="high",
         )
 
-    # 7. Impersonating authority (bank, telecom, police, ministry) combined with a link (+20)
+    # G. Subtle Social Engineering / Authority Impersonation / Quiet Credential Sync (+25)
+    subtle_se_phrases = [
+        "الدعم التقني",
+        "فريق تقنيه المعلومات",
+        "عدم مزامنه بريدك",
+        "مزامنه الحساب",
+        "تفعيل البوابه البديله",
+        "استمرار خدمتك",
+        "اعاده التحقق من هويتك",
+        "تحديث البوابه",
+        "تحديث بيانات البطاقه الوطنيه",
+        "منحه الرعايه الاجتماعيه",
+        "it support team",
+        "helpdesk",
+        "mailbox sync",
+        "alternate portal",
+        "confirm your access",
+        "re-validate your profile",
+        "vendor payment details",
+        "audit review",
+    ]
     authority_phrases = [
         "المصرف",
         "مصرف الرافدين",
@@ -683,47 +846,55 @@ def analyze_message(text: str, url: str | None = None) -> AnalysisResult:
         "government",
         "customer support",
     ]
-    if urls:
-        authority_match = _match_phrases(raw_text, norm_text, index_map, authority_phrases)
-        if authority_match:
-            add_reason(
-                "authority_impersonation_link",
-                20,
-                "انتحال صفة جهة رسمية أو مصرفية مع إرفاق رابط",
-                "Authority or bank impersonation combined with a link",
-                "المؤسسات الرسمية والبنوك والمصارف لا ترسل روابط عشوائية لتحديث الحسابات عبر الرسائل.",
-                "Banks, telecoms, and government bodies do not ask for account updates via unsolicited links.",
-                authority_match,
-                "phishing_bank",
-            )
+    subtle_match = _match_phrases(raw_text, norm_text, index_map, subtle_se_phrases)
+    authority_match = _match_phrases(raw_text, norm_text, index_map, authority_phrases)
 
-    # 8. Excessive punctuation, ALL CAPS, or many emojis (+5)
+    if subtle_match and (urls or has_action_or_link or bool(transfer_match)) and not all_official_urls:
+        add_reason(
+            "subtle_social_engineering",
+            30,
+            "هندسة اجتماعية هادئة تطلب تأكيد الوصول أو تحديث بيانات عبر قناة بديلة",
+            "Subtle social engineering / alternate-portal credential lure",
+            "تنتحل هذه الصيغة صفة دعم تقني أو مالي دون كلمات صاخبة لإقناع الضحية بتأكيد الدخول أو التحويل.",
+            "Uses calm administrative/IT-support framing instead of noisy buzzwords to elicit credentials or transfers.",
+            subtle_match,
+            "phishing_bank",
+            "social_engineering",
+            severity="high",
+        )
+    elif urls and authority_match and not all_official_urls:
+        add_reason(
+            "authority_impersonation_link",
+            20,
+            "انتحال أو إشارة لجهة مصرفية/رسمية مع رابط غير موثّق",
+            "Bank/authority reference combined with unverified link",
+            "المصارف والمؤسسات الرسمية لا ترسل روابط خارج نطاقاتها الموثقة لتحديث البيانات.",
+            "Banks and authorities do not request updates via unofficial external domains.",
+            authority_match,
+            "phishing_bank",
+            "fake_authority_impersonation",
+            severity="high",
+        )
+
+    # H. Excessive formatting (+5 only if combined with another signal)
     punct_bursts = re.findall(r"[!؟?]{3,}", raw_text)
-    caps_words = re.findall(r"\b[A-Z]{4,}\b", raw_text)
-    # Exclude normal acronyms like OTP, CVV, PIN, URL, HTTP from triggering ALL CAPS alone unless >= 2 words
-    non_code_caps = [w for w in caps_words if w not in {"HTTP", "HTTPS"}]
     emojis = EMOJI_REGEX.findall(raw_text)
-    formatting_match = ""
-    if punct_bursts:
-        formatting_match = punct_bursts[0]
-    elif len(non_code_caps) >= 2:
-        formatting_match = " ".join(non_code_caps[:2])
-    elif len(emojis) >= 4:
-        formatting_match = "".join(emojis[:4])
-
-    if formatting_match:
+    if (punct_bursts or len(emojis) >= 4) and len(reasons) > 0:
+        fmt = punct_bursts[0] if punct_bursts else "".join(emojis[:4])
         add_reason(
             "excessive_formatting",
             5,
-            "أسلوب مبالغ فيه بالعلامات أو الأحرف الكبيرة أو الرموز",
-            "Excessive punctuation, ALL CAPS, or emoji density",
-            "الرسائل الاحتيالية تعتمد على التهويل البصري وكثرة علامات التعجب والرموز لجذب الانتباه.",
-            "Scam texts frequently rely on excessive exclamation marks, all-caps urgency, or emoji clutter.",
-            formatting_match,
+            "تهويل بصري بالعلامات أو الرموز التعبيرية",
+            "Visual pressure via excessive punctuation or emojis",
+            "تستخدم مع مؤشرات أخرى لرفع التوتر البصري.",
+            "Combined with scam cues to amplify visual urgency.",
+            fmt,
             "other",
+            "social_engineering",
+            severity="low",
         )
 
-    # 9. Zero-width character or heavy tatweel obfuscation (+15)
+    # I. Text Obfuscation (+15)
     zw_matches = re.findall(r"[\u200B-\u200D\uFEFF]+", raw_text)
     tatweel_burst = re.search(r"[^\s]*\u0640{3,}[^\s]*", raw_text)
     if len(zw_matches) >= 2 or tatweel_burst:
@@ -731,18 +902,22 @@ def analyze_message(text: str, url: str | None = None) -> AnalysisResult:
         add_reason(
             "text_obfuscation",
             15,
-            "تمويه النص برموز مخفية أو تطويل مفرط لتجاوز الفلاتر",
-            "Hidden zero-width characters or tatweel filter-evasion",
-            "الرسالة تستخدم رموزاً غير مرئية أو تطويل حروف غير طبيعي للتحايل على أنظمة الحماية.",
-            "The text uses invisible zero-width characters or excessive elongation to bypass spam filters.",
+            "تمويه النص برموز غير مرئية أو تطويل مفرط لتجاوز الفلاتر",
+            "Zero-width characters or tatweel filter evasion",
+            "تمويه الكلمات الحساسة تقنية معروفة لتخطي فلاتر الرسائل.",
+            "Obfuscating words with zero-width characters or elongation evades naive keyword filters.",
             obf_match,
             "other",
+            "filter_evasion",
+            severity="medium",
         )
 
     raw_score = sum(r["points"] for r in reasons)
 
-    # Safe-signal rule: no links, no sensitive-data request, no urgency -> subtract 10 (min 0)
-    if not urls and not has_sensitive and not has_urgency:
+    # Benign institutional context dampener if no sensitive credential request & no malicious URL
+    if has_benign_context and not has_sensitive and not has_risky_url and not transfer_match:
+        raw_score = max(0, raw_score - 20)
+    elif not urls and not has_sensitive and not has_urgency and not transfer_match and not subtle_match:
         raw_score = max(0, raw_score - 10)
 
     final_score = max(0, min(100, raw_score))
@@ -754,7 +929,18 @@ def analyze_message(text: str, url: str | None = None) -> AnalysisResult:
     else:
         verdict = "dangerous"
 
-    # Choose category from highest-scoring specific group; fall back to 'other' only if none scored
+    risk_level: RiskLevel = (
+        "critical"
+        if final_score >= 80
+        else "high"
+        if final_score >= 60
+        else "medium"
+        if final_score >= 30
+        else "low"
+        if final_score >= 10
+        else "minimal"
+    )
+
     specific_priority = [
         "otp_theft",
         "fake_prize",
@@ -771,17 +957,126 @@ def analyze_message(text: str, url: str | None = None) -> AnalysisResult:
             best_pts = pts
             best_category = cat
 
-    url_forensics = [inspect_url_forensics(u) for u in urls]
+    # Flag links needing separate live Threat Intel verification
+    links_requiring_verification: list[dict[str, Any]] = []
+    for uf in url_forensics:
+        needs_intel = not uf["is_official_brand"]
+        links_requiring_verification.append(
+            {
+                "url": uf["original_url"],
+                "defanged_url": uf["defanged_url"],
+                "static_classification": uf["classification"],
+                "needs_separate_intel_check": needs_intel,
+                "reason_ar": (
+                    "هذا الرابط ليس نطاقاً رسمياً موثقاً ويحتاج فحصاً منفصلاً عبر قواعد Threat Intelligence و Sandbox الآمن."
+                    if needs_intel
+                    else "النطاق يطابق مرجعاً رسمياً، ومع ذلك يُنصح بفحصه إذا كان مختصراً أو متغيراً."
+                ),
+                "reason_en": (
+                    "URL is not on the verified official domain registry and requires separate Threat Intel / Sandbox inspection."
+                    if needs_intel
+                    else "Domain matches a known official entry; verify context independently."
+                ),
+            }
+        )
+
+    # Recommended user actions tailored to findings
+    recommended_actions: list[dict[str, str]] = []
+    if verdict == "dangerous":
+        recommended_actions.extend(
+            [
+                {
+                    "ar": "تجنب التفاعل مع الرسالة تماماً ولا تفتح الروابط ولا ترسل أي رمز تحقق أو بيانات بطاقة.",
+                    "en": "Do not reply, click embedded links, or share any OTP, password, or card details.",
+                },
+                {
+                    "ar": "تواصل مع الجهة المذكورة عبر رقمها أو تطبيقها الرسمي فقط للتحقق المستقل.",
+                    "en": "Verify directly through the institution's official website or known customer service line.",
+                },
+            ]
+        )
+    elif verdict == "suspicious":
+        recommended_actions.extend(
+            [
+                {
+                    "ar": "لا تقم بأي إجراء عاجل؛ افحص أي رابط مرفق في تبويب «تشريح رابط» أو «Sandbox الآمن» أولاً.",
+                    "en": "Do not rush; inspect any attached URL in URL X-Ray or Safe Sandbox first.",
+                },
+                {
+                    "ar": "تحقق من هوية المرسل عبر قناة اتصال أخرى معروفة مسبقاً.",
+                    "en": "Confirm sender identity out-of-band via a known trusted channel.",
+                },
+            ]
+        )
+    else:
+        recommended_actions.append(
+            {
+                "ar": "لم تُرصد مؤشرات احتيال قوية في النص، لكن غياب المؤشرات لا يضمن سلامة الروابط غير المفحوصة خارجياً.",
+                "en": "No strong phishing cues detected in text, though embedded unfamiliar links still merit caution.",
+            }
+        )
+
+    if urls:
+        recommended_actions.append(
+            {
+                "ar": "يوجد رابط مرفق — استخدم زر «اختبار الرابط في Sandbox الآمن» أو «فحص حي» قبل الوثوق به.",
+                "en": "Embedded URL found — run live Threat Intel probe or Safe Sandbox before opening.",
+            }
+        )
+
+    auxiliary_llm = (
+        _run_optional_gemini_auxiliary(raw_text)
+        if use_auxiliary_llm
+        else {
+            "used": False,
+            "status": "skipped",
+            "summary_ar": "اعتمد الفحص على المحرك الحتمي السياقي دون استدعاء نموذج لغوي خارجي.",
+            "summary_en": "Analyzed purely by the deterministic context engine without external LLM calls.",
+        }
+    )
+
+    limitations = [
+        make_limitation(
+            "message_text_scope",
+            "تحليل الرسالة يقيّم الأنماط اللغوية وبنية الروابط ساكنًا؛ المرفقات أو الروابط تحتاج فحص Threat Intelligence منفصل للتحقق من سمعتها الحية.",
+            "Message analysis evaluates linguistic cues and URL structure statically; URLs require separate Threat Intel lookup for live reputation.",
+        )
+    ]
+    if urls:
+        limitations.append(
+            make_limitation(
+                "urls_need_live_intel",
+                f"تحتوي الرسالة على {len(urls)} رابط/روابط تحتاج فحصاً منفصلاً عبر Threat Intelligence.",
+                f"Message contains {len(urls)} link(s) requiring separate Threat Intelligence verification.",
+            )
+        )
+
+    bundle = build_evidence_bundle(
+        evidence=evidence,
+        risk_level=risk_level,
+        limitations=limitations,
+        has_authoritative_hit=False,
+        data_sufficient=len(raw_text.strip()) >= 8,
+        scan_timestamp=scan_ts,
+    )
 
     return {
         "score": final_score,
         "verdict": verdict,
+        "risk_level": risk_level,
         "category": best_category,
+        "threat_types": threat_types,
         "reasons": reasons,
         "highlights": highlights,
+        "suspicious_segments": suspicious_segments,
+        "links_requiring_verification": links_requiring_verification,
+        "recommended_actions": recommended_actions,
+        "auxiliary_llm": auxiliary_llm,
         "fingerprint": compute_fingerprint(raw_text),
         "urls": urls,
         "url_forensics": url_forensics,
+        "evidence_bundle": bundle,
+        "scan_timestamp": scan_ts,
     }
 
 
@@ -823,4 +1118,3 @@ def analyze_batch(messages: list[str]) -> dict[str, object]:
         "max_score": max_score,
         "items": items,
     }
-

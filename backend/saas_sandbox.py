@@ -106,7 +106,7 @@ def run_sandbox_benchmark(
     for idx in range(count):
         acad_text = SANDBOX_ACADEMIC_SAMPLES[idx % len(SANDBOX_ACADEMIC_SAMPLES)]
         acad_res = analyze_academic_text(acad_text)
-        if acad_res["ai_probability"] >= 45 or acad_res["plagiarism_pct"] >= 30:
+        if (acad_res.get("ai_probability") or 0) >= 45 or acad_res["plagiarism_pct"] >= 30:
             ai_flagged += 1
 
         cyber_text = SANDBOX_CYBER_SAMPLES[idx % len(SANDBOX_CYBER_SAMPLES)]

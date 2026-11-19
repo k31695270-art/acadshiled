@@ -14,6 +14,7 @@ from academic_analyzer import analyze_academic_text, scan_dlp_content
 from analyzer import analyze_batch, analyze_message
 from blockchain import get_dashboard_summary, issue_certificate, verify_certificate
 from db import get_community_stats, get_trending, init_db, save_report
+from evaluate_models import run_all_evaluations
 from quiz import get_quiz_scenarios, verify_quiz_answer
 from saas_sandbox import (
     delete_saas_tenant,
@@ -23,6 +24,7 @@ from saas_sandbox import (
     run_sandbox_benchmark,
 )
 from url_inspector import probe_url_live
+from url_sandbox import detonate_url_in_sandbox
 
 RATE_LIMIT_MAX_REQUESTS = 30
 RATE_LIMIT_WINDOW_SECONDS = 60.0
@@ -45,9 +47,20 @@ app.add_middleware(
 _rate_buckets: dict[str, Deque[float]] = defaultdict(deque)
 
 
+@app.middleware("http")
+async def add_security_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+    return response
+
+
 class AnalyzeRequest(BaseModel):
     text: str = Field(..., min_length=1, max_length=5000)
     url: str | None = Field(default=None, max_length=2000)
+    use_auxiliary_llm: bool = False
 
 
 class BatchAnalyzeRequest(BaseModel):
@@ -56,6 +69,7 @@ class BatchAnalyzeRequest(BaseModel):
 
 class InspectUrlRequest(BaseModel):
     url: str = Field(..., min_length=3, max_length=2000)
+    include_intel: bool = True
 
 
 class AcademicAnalyzeRequest(BaseModel):
@@ -107,8 +121,12 @@ def on_startup() -> None:
 
 def _check_rate_limit(client_ip: str) -> None:
     now = time.monotonic()
-    bucket = _rate_buckets[client_ip]
     cutoff = now - RATE_LIMIT_WINDOW_SECONDS
+    if len(_rate_buckets) > 512:
+        stale = [k for k, q in _rate_buckets.items() if not q or q[-1] < cutoff]
+        for k in stale:
+            del _rate_buckets[k]
+    bucket = _rate_buckets[client_ip]
     while bucket and bucket[0] < cutoff:
         bucket.popleft()
     if len(bucket) >= RATE_LIMIT_MAX_REQUESTS:
@@ -131,7 +149,7 @@ def analyze(payload: AnalyzeRequest, request: Request):
     text = payload.text.strip()
     if not text:
         raise HTTPException(status_code=400, detail="Message text is required")
-    return analyze_message(text, payload.url)
+    return analyze_message(text, payload.url, use_auxiliary_llm=payload.use_auxiliary_llm)
 
 
 @app.post("/api/analyze-batch")
@@ -148,7 +166,14 @@ def analyze_batch_endpoint(payload: BatchAnalyzeRequest, request: Request):
 def inspect_url_endpoint(payload: InspectUrlRequest, request: Request):
     client_ip = request.client.host if request.client else "unknown"
     _check_rate_limit(client_ip)
-    return probe_url_live(payload.url.strip())
+    return probe_url_live(payload.url.strip(), include_intel=payload.include_intel)
+
+
+@app.post("/api/sandbox-url")
+def sandbox_url_endpoint(payload: InspectUrlRequest, request: Request):
+    client_ip = request.client.host if request.client else "unknown"
+    _check_rate_limit(client_ip)
+    return detonate_url_in_sandbox(payload.url.strip())
 
 
 @app.post("/api/academic/analyze")
@@ -236,7 +261,9 @@ def quiz_verify(payload: QuizVerifyRequest):
 
 
 @app.post("/api/report")
-def report(payload: ReportRequest):
+def report(payload: ReportRequest, request: Request):
+    client_ip = request.client.host if request.client else "unknown"
+    _check_rate_limit(client_ip)
     return save_report(
         category=payload.category,
         score=payload.score,
@@ -247,3 +274,10 @@ def report(payload: ReportRequest):
 @app.get("/api/trending")
 def trending():
     return {"items": get_trending(), "stats": get_community_stats()}
+
+
+@app.get("/api/evaluation")
+def evaluation_endpoint(request: Request):
+    client_ip = request.client.host if request.client else "unknown"
+    _check_rate_limit(client_ip)
+    return run_all_evaluations()

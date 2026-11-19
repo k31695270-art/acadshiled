@@ -25,9 +25,9 @@ import { ScanHistory } from './components/ScanHistory';
 import { PhishingQuiz } from './components/PhishingQuiz';
 import { AcademicShield } from './components/AcademicShield';
 import { DlpScanner } from './components/DlpScanner';
-import { ExecutiveDashboard } from './components/ExecutiveDashboard';
+import { UrlSandboxPanel } from './components/UrlSandboxPanel';
 
-type AnalyzerTab = 'single' | 'batch' | 'url' | 'academic' | 'dlp' | 'history';
+type AnalyzerTab = 'single' | 'batch' | 'url' | 'sandbox' | 'academic' | 'dlp' | 'history';
 
 const HISTORY_STORAGE_KEY = 'kashf_scan_history_v1';
 
@@ -57,7 +57,8 @@ export default function App() {
   const [trendingStats, setTrendingStats] = useState<CommunityStats | null>(null);
   const [trendingLoading, setTrendingLoading] = useState(true);
   const [trendingError, setTrendingError] = useState(false);
-  const [dashboardRefreshKey, setDashboardRefreshKey] = useState(0);
+  const [sandboxUrl, setSandboxUrl] = useState('');
+  const [sandboxTriggerKey, setSandboxTriggerKey] = useState(0);
 
   const analyzerSectionRef = useRef<HTMLElement | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
@@ -245,9 +246,21 @@ export default function App() {
     const ok = await reportResult();
     if (ok) {
       void fetchTrending();
-      setDashboardRefreshKey((k) => k + 1);
     }
     return ok;
+  };
+
+  const handleOpenSandbox = (url: string) => {
+    setSandboxUrl(url);
+    setSandboxTriggerKey((k) => k + 1);
+    setActiveTab('sandbox');
+    const prefersReduced =
+      typeof window !== 'undefined' &&
+      window.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
+    analyzerSectionRef.current?.scrollIntoView({
+      behavior: prefersReduced ? 'auto' : 'smooth',
+      block: 'start',
+    });
   };
 
   const resultRef = useCallback((node: HTMLDivElement | null) => {
@@ -269,6 +282,7 @@ export default function App() {
     { id: 'single', label: t.hero.tabs.single },
     { id: 'batch', label: t.hero.tabs.batch },
     { id: 'url', label: t.hero.tabs.urlInspector },
+    { id: 'sandbox', label: t.hero.tabs.sandbox },
     { id: 'academic', label: t.hero.tabs.academic },
     { id: 'dlp', label: t.hero.tabs.dlp },
     {
@@ -498,6 +512,7 @@ export default function App() {
                         reported={reported}
                         reportError={reportError}
                         onReport={handleReportAndRefresh}
+                        onOpenSandbox={handleOpenSandbox}
                       />
                     </div>
                   ) : null}
@@ -505,12 +520,15 @@ export default function App() {
               ) : activeTab === 'batch' ? (
                 <BatchScanner lang={lang} onInspectMessage={handleInspectInSingle} />
               ) : activeTab === 'url' ? (
-                <UrlLab lang={lang} />
-              ) : activeTab === 'academic' ? (
-                <AcademicShield
+                <UrlLab lang={lang} onOpenSandbox={handleOpenSandbox} />
+              ) : activeTab === 'sandbox' ? (
+                <UrlSandboxPanel
                   lang={lang}
-                  onCertificateIssued={() => setDashboardRefreshKey((k) => k + 1)}
+                  initialUrl={sandboxUrl}
+                  autoRunKey={sandboxTriggerKey}
                 />
+              ) : activeTab === 'academic' ? (
+                <AcademicShield lang={lang} />
               ) : activeTab === 'dlp' ? (
                 <DlpScanner lang={lang} />
               ) : (
@@ -522,22 +540,6 @@ export default function App() {
                 />
               )}
             </section>
-
-            {/* AcadShield Executive Dashboard & Hash-Chain Ledger */}
-            <ExecutiveDashboard
-              lang={lang}
-              refreshKey={dashboardRefreshKey}
-              onLaunchAnalyzerTab={(tab) => {
-                setActiveTab(tab);
-                const prefersReduced =
-                  typeof window !== 'undefined' &&
-                  window.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
-                analyzerSectionRef.current?.scrollIntoView({
-                  behavior: prefersReduced ? 'auto' : 'smooth',
-                  block: 'start',
-                });
-              }}
-            />
 
             {/* Trending Scams */}
             <TrendingSection

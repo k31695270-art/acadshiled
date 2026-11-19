@@ -1,43 +1,12 @@
-"""Pure-Python Academic Integrity (AI Detector + Plagiarism + Behavioral Biometrics) & DLP Scanner."""
+"""Pure-Python Academic Integrity (Calibrated AI Stylometry + Plagiarism + Behavioral Biometrics) & DLP Scanner."""
 
 from __future__ import annotations
 
-import math
 import re
-import statistics
 from typing import Any, TypedDict
 
+from ai_detector import analyze_ai_vs_human
 from analyzer import analyze_message, normalize_arabic
-
-AI_PHRASES_AR = [
-    "مما لا شك فيه",
-    "علاوة على ذلك",
-    "في الختام",
-    "تجدر الاشاره الي",
-    "بناء علي ما سبق",
-    "من ناحيه اخري",
-    "يلعب دورا حيويا",
-    "في عصرنا الحالي",
-    "لا يمكن اغفال",
-    "بشكل عام يمكن القول",
-    "في نهايه المطاف",
-    "تعد من اهم الركائز",
-]
-
-AI_PHRASES_EN = [
-    "moreover",
-    "furthermore",
-    "in conclusion",
-    "it is worth noting",
-    "delve into",
-    "comprehensive overview",
-    "plays a crucial role",
-    "in today's rapidly evolving",
-    "on the other hand",
-    "undoubtedly",
-    "testament to",
-    "landscape of",
-]
 
 # Built-in sample academic reference corpus for offline shingling plagiarism checks
 BUILTIN_CORPUS: list[dict[str, str]] = [
@@ -110,11 +79,6 @@ def _tokenize_words(text: str) -> list[str]:
     return re.findall(r"[\w\u0600-\u06FF]+", text.lower())
 
 
-def _split_sentences(text: str) -> list[str]:
-    parts = re.split(r"[.!؟?\n]+", text)
-    return [p.strip() for p in parts if len(p.strip().split()) >= 3]
-
-
 def _word_shingles(words: list[str], k: int = 4) -> set[tuple[str, ...]]:
     if len(words) < k:
         return {tuple(words)} if words else set()
@@ -148,56 +112,15 @@ def analyze_academic_text(
     reference_text: str | None = None,
     behavior: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Evaluate AI generation likelihood, plagiarism overlap, and behavioral typing authenticity."""
+    """Evaluate calibrated AI stylometry, n-gram plagiarism overlap, and typing behavior."""
     raw = (text or "").strip()[:15000]
+    ai_res = analyze_ai_vs_human(raw)
     words = _tokenize_words(raw)
-    word_count = len(words)
-    sentences = _split_sentences(raw)
-
-    # 1. Stylometry: Burstiness (sentence length std dev) & Vocabulary Richness (TTR)
-    sent_lengths = [len(_tokenize_words(s)) for s in sentences]
-    if len(sent_lengths) >= 2:
-        mean_len = statistics.mean(sent_lengths)
-        std_len = statistics.pstdev(sent_lengths)
-        cv_len = std_len / max(1.0, mean_len)
-    else:
-        mean_len = float(word_count)
-        std_len = 0.0
-        cv_len = 0.45
-
-    unique_words = set(words)
-    ttr = round(len(unique_words) / max(1, word_count), 2)
-
-    # 2. AI formulaic transition detection
+    word_count = int(ai_res["word_count"])
+    sentence_count = int(ai_res["sentence_count"])
     norm = normalize_arabic(raw)
-    matched_ai_phrases: list[str] = []
-    for phrase in AI_PHRASES_AR + AI_PHRASES_EN:
-        norm_p = normalize_arabic(phrase)
-        if norm_p and norm_p in norm:
-            matched_ai_phrases.append(phrase)
 
-    ai_score = 15  # neutral baseline
-    if len(matched_ai_phrases) >= 3:
-        ai_score += 45
-    elif len(matched_ai_phrases) == 2:
-        ai_score += 30
-    elif len(matched_ai_phrases) == 1:
-        ai_score += 15
-
-    # Low sentence-length variance indicates machine uniformity
-    if len(sent_lengths) >= 3 and cv_len < 0.25:
-        ai_score += 22
-    elif len(sent_lengths) >= 3 and cv_len > 0.48:
-        ai_score -= 10
-
-    # Repetitive vocabulary on longer essays
-    if word_count >= 50 and ttr < 0.52:
-        ai_score += 15
-    elif word_count >= 40 and ttr >= 0.68:
-        ai_score -= 8
-
-    # 3. Plagiarism Shingling (against user-supplied reference OR built-in academic corpus)
-    doc_shingles = _word_shingles(words, k=4)
+    # Plagiarism Shingling (against user-supplied reference OR built-in academic corpus)
     plagiarism_matches: list[dict[str, Any]] = []
     max_overlap_pct = 0
 
@@ -211,11 +134,11 @@ def analyze_academic_text(
             },
         )
 
+    doc_norm_words = _tokenize_words(norm)
+    doc_norm_shingles = _word_shingles(doc_norm_words, k=4)
     for src in corpus_sources:
         ref_words = _tokenize_words(normalize_arabic(src["text"]))
-        doc_norm_words = _tokenize_words(norm)
         ref_shingles = _word_shingles(ref_words, k=4)
-        doc_norm_shingles = _word_shingles(doc_norm_words, k=4)
         if not doc_norm_shingles or not ref_shingles:
             continue
         inter = doc_norm_shingles.intersection(ref_shingles)
@@ -233,7 +156,7 @@ def analyze_academic_text(
                     }
                 )
 
-    # 4. Behavioral Typing Biometrics evaluation
+    # Behavioral Typing Biometrics evaluation (kept separate from text stylometry)
     behavior_status = "not_captured"
     behavior_score = 100
     paste_ratio = 0.0
@@ -245,67 +168,61 @@ def analyze_academic_text(
         paste_ratio = round(min(1.0, pasted_chars / total_chars), 2)
 
         if keystrokes >= 15 and paste_ratio < 0.25:
-            # Organic human typing shows natural variance
             if interval_std >= 20:
                 behavior_status = "human_verified"
                 behavior_score = 94
             else:
                 behavior_status = "robotic_cadence"
                 behavior_score = 45
-                ai_score += 15
         elif paste_ratio >= 0.65:
             behavior_status = "bulk_pasted"
             behavior_score = 35
-            ai_score += 12
         elif keystrokes > 0:
             behavior_status = "mixed_input"
             behavior_score = 72
 
-    ai_probability = max(0, min(100, ai_score))
+    cal_prob = ai_res["calibrated_ai_probability"]
+    ai_probability = round(cal_prob * 100) if cal_prob is not None else None
     plagiarism_pct = max(0, min(100, max_overlap_pct))
-    originality_score = max(0, min(100, round(100 - (plagiarism_pct * 0.65 + ai_probability * 0.35))))
 
-    if originality_score >= 70:
-        verdict = "authentic"
-    elif originality_score >= 45:
+    # Originality reflects reference overlap + calibrated AI alignment (when calibrated)
+    effective_ai_pct = ai_probability if ai_probability is not None else 50
+    originality_score = max(0, min(100, round(100 - (plagiarism_pct * 0.65 + effective_ai_pct * 0.35))))
+
+    if plagiarism_pct >= 30 or ai_res["classification"] == "ai_leaning":
+        verdict = "flagged" if (plagiarism_pct >= 40 or (ai_probability is not None and ai_probability >= 75)) else "review_needed"
+    elif ai_res["classification"] == "inconclusive" or behavior_status in {"bulk_pasted", "robotic_cadence"}:
         verdict = "review_needed"
     else:
-        verdict = "flagged"
+        verdict = "authentic"
 
     signals: list[dict[str, str]] = []
-    if matched_ai_phrases:
+    for ev in ai_res["evidence_bundle"]["evidence"]:
         signals.append(
             {
-                "severity": "medium",
-                "title_ar": f"رصد {len(matched_ai_phrases)} تعابير نمطية شائعة في نصوص الذكاء الاصطناعي",
-                "title_en": f"Detected {len(matched_ai_phrases)} formulaic AI transition phrases",
-                "detail": ", ".join(matched_ai_phrases[:4]),
+                "severity": "safe" if ev["severity"] == "safe" else "medium",
+                "title_ar": ev["title_ar"],
+                "title_en": ev["title_en"],
+                "detail": f"{ev['source']} · {ev['observed_value']}",
             }
         )
-    if len(sent_lengths) >= 3 and cv_len < 0.25:
-        signals.append(
-            {
-                "severity": "medium",
-                "title_ar": "انتظام إيقاعي مفرط في أطوال الجمل (انخفاض التنوع البشري)",
-                "title_en": "Low sentence-length burstiness (uniform machine cadence)",
-                "detail": f"CV={round(cv_len, 2)}",
-            }
-        )
+
     if plagiarism_matches:
         signals.append(
             {
                 "severity": "high",
-                "title_ar": f"تشابه نصي بنسبة {plagiarism_pct}% مع مصادر مرجعية",
-                "title_en": f"{plagiarism_pct}% n-gram overlap with reference corpus",
+                "title_ar": f"تشابه نصي بنسبة {plagiarism_pct}% مع مصادر مرجعية (4-gram)",
+                "title_en": f"{plagiarism_pct}% 4-gram overlap with reference corpus",
                 "detail": plagiarism_matches[0]["source"],
             }
         )
+
     if behavior_status == "human_verified":
         signals.append(
             {
                 "severity": "safe",
-                "title_ar": "البصمة السلوكية للكتابة تؤكد الإدخال البشري العضوي",
-                "title_en": "Behavioral typing biometrics confirm organic human authorship",
+                "title_ar": "البصمة السلوكية للكتابة تشير لإدخال بشري حي",
+                "title_en": "Behavioral typing cadence aligns with live human input",
                 "detail": f"Paste ratio: {int(paste_ratio * 100)}%",
             }
         )
@@ -313,22 +230,25 @@ def analyze_academic_text(
         signals.append(
             {
                 "severity": "medium",
-                "title_ar": "نسبة لصق مباشر مرتفعة مقارنةً بعدد ضغطات المفاتيح",
-                "title_en": "High bulk-paste ratio relative to live keystrokes",
+                "title_ar": "نسبة لصق مباشر مرتفعة مقارنةً بضغطات المفاتيح",
+                "title_en": "High bulk-paste ratio relative to keystrokes",
                 "detail": f"Paste ratio: {int(paste_ratio * 100)}%",
             }
         )
 
+    metrics = ai_res["metrics"]
+    root_ttr = metrics["root_ttr"]
+    richness_norm = min(1.0, round(root_ttr / 8.5, 2))
+
     return {
         "word_count": word_count,
-        "sentence_count": len(sentences),
-        "lexical_richness": ttr,
-        "burstiness": round(cv_len, 2),
+        "sentence_count": sentence_count,
+        "lexical_richness": richness_norm,
+        "burstiness": round(metrics["burstiness_cv"], 2),
         "ai_probability": ai_probability,
         "plagiarism_pct": plagiarism_pct,
         "originality_score": originality_score,
         "verdict": verdict,
-        "matched_ai_phrases": matched_ai_phrases,
         "plagiarism_matches": plagiarism_matches,
         "behavior": {
             "status": behavior_status,
@@ -336,7 +256,8 @@ def analyze_academic_text(
             "paste_ratio": paste_ratio,
         },
         "signals": signals,
-        "eligible_for_certificate": originality_score >= 70 and word_count >= 15,
+        "ai_detection": ai_res,
+        "eligible_for_certificate": originality_score >= 70 and word_count >= 15 and plagiarism_pct < 15,
     }
 
 
@@ -368,7 +289,6 @@ def scan_dlp_content(text: str) -> dict[str, Any]:
                 }
             )
 
-    # Also run phishing/URL security check via analyzer.analyze_message
     cyber_res = analyze_message(raw[:5000])
     risk_score = min(100, cyber_res["score"] + len(findings) * 20)
     verdict = "safe" if risk_score <= 29 else ("suspicious" if risk_score <= 64 else "dangerous")

@@ -23,7 +23,6 @@ export function Navbar({ lang, onToggleLang }: NavbarProps) {
 
   const navItems = [
     { href: '#analyzer', label: t.nav.analyzer },
-    { href: '#dashboard', label: t.nav.dashboard },
     { href: '#trending', label: t.nav.trending },
     { href: '#quiz', label: t.nav.quiz },
     { href: '#learn', label: t.nav.learn },

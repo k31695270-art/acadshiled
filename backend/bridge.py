@@ -24,7 +24,9 @@ from saas_sandbox import (  # noqa: E402
     register_saas_tenant,
     run_sandbox_benchmark,
 )
+from evaluate_models import run_all_evaluations  # noqa: E402
 from url_inspector import probe_url_live  # noqa: E402
+from url_sandbox import detonate_url_in_sandbox  # noqa: E402
 
 
 def main() -> int:
@@ -34,7 +36,11 @@ def main() -> int:
     action = payload.get("action")
 
     if action == "analyze":
-        result = analyze_message(payload.get("text", ""), payload.get("url"))
+        result = analyze_message(
+            payload.get("text", ""),
+            payload.get("url"),
+            use_auxiliary_llm=bool(payload.get("use_auxiliary_llm", False)),
+        )
         print(json.dumps(result, ensure_ascii=False))
         return 0
 
@@ -51,7 +57,19 @@ def main() -> int:
         if not raw_url:
             print(json.dumps({"error": "url is required"}))
             return 1
-        result = probe_url_live(raw_url)
+        result = probe_url_live(
+            raw_url,
+            include_intel=bool(payload.get("include_intel", True)),
+        )
+        print(json.dumps(result, ensure_ascii=False))
+        return 0
+
+    if action == "sandbox_url":
+        raw_url = str(payload.get("url", "")).strip()
+        if not raw_url:
+            print(json.dumps({"error": "url is required"}))
+            return 1
+        result = detonate_url_in_sandbox(raw_url)
         print(json.dumps(result, ensure_ascii=False))
         return 0
 
@@ -146,6 +164,10 @@ def main() -> int:
         items = get_trending()
         stats = get_community_stats()
         print(json.dumps({"items": items, "stats": stats}, ensure_ascii=False))
+        return 0
+
+    if action == "evaluate":
+        print(json.dumps(run_all_evaluations(), ensure_ascii=False))
         return 0
 
     print(json.dumps({"error": "unknown action"}))

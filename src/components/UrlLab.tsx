@@ -5,9 +5,10 @@ import { UrlForensicsPanel } from './UrlForensicsPanel';
 
 interface UrlLabProps {
   lang: Language;
+  onOpenSandbox?: (url: string) => void;
 }
 
-export function UrlLab({ lang }: UrlLabProps) {
+export function UrlLab({ lang, onOpenSandbox }: UrlLabProps) {
   const t = i18n[lang];
   const [urlValue, setUrlValue] = useState('');
   const [loading, setLoading] = useState(false);
@@ -101,6 +102,17 @@ export function UrlLab({ lang }: UrlLabProps) {
           >
             paypa1-secure.xyz
           </button>
+
+          <button
+            type="button"
+            onClick={() => {
+              setUrlValue('https://example.com');
+              setError(null);
+            }}
+            className="inline-flex min-h-10 items-center justify-center whitespace-nowrap rounded-full border border-black/15 bg-white px-4 py-1.5 text-xs font-medium text-black transition-colors hover:bg-black hover:text-white focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-black"
+          >
+            example.com
+          </button>
         </div>
       </form>
 
@@ -114,6 +126,7 @@ export function UrlLab({ lang }: UrlLabProps) {
             forensics={probeResult.forensics}
             lang={lang}
             initialProbe={probeResult}
+            onOpenSandbox={onOpenSandbox}
           />
         </div>
       ) : null}

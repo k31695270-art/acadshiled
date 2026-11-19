@@ -10,6 +10,7 @@ import {
   buildBehaviorTelemetry,
   classifyBehaviorPreview,
 } from '../utils/behaviorTracker';
+import { EvidenceBundlePanel } from './EvidenceBundlePanel';
 
 interface AcademicShieldProps {
   lang: Language;
@@ -378,9 +379,36 @@ export function AcademicShield({ lang, onCertificateIssued }: AcademicShieldProp
               </h3>
             </div>
             <span className="text-xs tabular-nums text-black/55">
-              {result.word_count} words · {result.sentence_count} sentences
+              {lang === 'ar'
+                ? `${result.word_count} كلمة · ${result.sentence_count} جملة`
+                : `${result.word_count} words · ${result.sentence_count} sentences`}
             </span>
           </div>
+
+          {/* Calibrated AI vs Human Origin Banner + Probabilistic Disclaimer */}
+          {result.ai_detection ? (
+            <div
+              className={`rounded-xl border p-4 text-sm ${
+                result.ai_detection.classification === 'inconclusive'
+                  ? 'border-[#d97706]/35 bg-[#d97706]/10 text-[#78350f]'
+                  : result.ai_detection.classification === 'ai_leaning'
+                    ? 'border-[#dc2626]/25 bg-[#dc2626]/5 text-[#7f1d1d]'
+                    : 'border-[#16a34a]/25 bg-[#16a34a]/5 text-[#14532d]'
+              }`}
+              data-testid="ai-classification-banner"
+            >
+              <p className="font-medium">
+                {lang === 'ar'
+                  ? result.ai_detection.headline_ar
+                  : result.ai_detection.headline_en}
+              </p>
+              <p className="mt-1 text-xs opacity-85">
+                {lang === 'ar'
+                  ? `اللغة: ${result.ai_detection.language.toUpperCase()} · معامل معايرة النموذج (OOF Brier): ${result.ai_detection.model_oof_brier}`
+                  : `Pipeline: ${result.ai_detection.language.toUpperCase()} · Out-of-fold Brier score: ${result.ai_detection.model_oof_brier}`}
+              </p>
+            </div>
+          ) : null}
 
           {/* Metrics Grid */}
           <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
@@ -394,8 +422,15 @@ export function AcademicShield({ lang, onCertificateIssued }: AcademicShieldProp
             </div>
             <div className="rounded-xl border border-black/10 bg-[#f7f7f5] p-3.5">
               <span className="block text-xs text-black/55">{t.academic.aiProbLabel}</span>
-              <span className="mt-1 block text-2xl font-medium tabular-nums text-black">
-                {result.ai_probability}%
+              <span
+                className="mt-1 block text-2xl font-medium tabular-nums text-black"
+                data-testid="ai-probability-value"
+              >
+                {result.ai_probability !== null
+                  ? `${result.ai_probability}%`
+                  : lang === 'ar'
+                    ? 'غير محسوم'
+                    : 'Inconclusive'}
               </span>
             </div>
             <div className="rounded-xl border border-black/10 bg-[#f7f7f5] p-3.5">
@@ -426,6 +461,39 @@ export function AcademicShield({ lang, onCertificateIssued }: AcademicShieldProp
               </span>
             </div>
           </div>
+
+          {result.ai_detection ? (
+            <div className="grid grid-cols-2 gap-2.5 text-xs sm:grid-cols-4" data-testid="calibrated-stylometry-metrics">
+              <div className="rounded-lg border border-black/10 bg-[#f7f7f5] px-3 py-2">
+                <span className="block text-black/55">
+                  {lang === 'ar' ? 'تقريب الحيرة (Perplexity)' : 'Perplexity Proxy'}
+                </span>
+                <span className="font-mono font-medium tabular-nums text-black" dir="ltr">
+                  {result.ai_detection.metrics.perplexity_proxy}
+                </span>
+              </div>
+              <div className="rounded-lg border border-black/10 bg-[#f7f7f5] px-3 py-2">
+                <span className="block text-black/55">Root-TTR</span>
+                <span className="font-mono font-medium tabular-nums text-black" dir="ltr">
+                  {result.ai_detection.metrics.root_ttr}
+                </span>
+              </div>
+              <div className="rounded-lg border border-black/10 bg-[#f7f7f5] px-3 py-2">
+                <span className="block text-black/55">Hapax Ratio</span>
+                <span className="font-mono font-medium tabular-nums text-black" dir="ltr">
+                  {result.ai_detection.metrics.hapax_ratio}
+                </span>
+              </div>
+              <div className="rounded-lg border border-black/10 bg-[#f7f7f5] px-3 py-2">
+                <span className="block text-black/55">
+                  {lang === 'ar' ? 'تنوع الترقيم' : 'Punct. Entropy'}
+                </span>
+                <span className="font-mono font-medium tabular-nums text-black" dir="ltr">
+                  {result.ai_detection.metrics.punctuation_entropy}
+                </span>
+              </div>
+            </div>
+          ) : null}
 
           {result.signals.length > 0 ? (
             <div>
@@ -609,6 +677,14 @@ export function AcademicShield({ lang, onCertificateIssued }: AcademicShieldProp
                 </div>
               )}
             </div>
+          ) : null}
+
+          {result.ai_detection?.evidence_bundle ? (
+            <EvidenceBundlePanel
+              bundle={result.ai_detection.evidence_bundle}
+              lang={lang}
+              hideEvidenceList
+            />
           ) : null}
         </div>
       ) : null}

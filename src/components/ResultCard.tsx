@@ -6,6 +6,7 @@ import { downloadShareCard } from '../utils/shareCard';
 import { buildFamilyWarningText } from '../utils/batchParse';
 import { RiskGauge } from './RiskGauge';
 import { UrlForensicsPanel } from './UrlForensicsPanel';
+import { EvidenceBundlePanel } from './EvidenceBundlePanel';
 
 interface ResultCardProps {
   result: AnalysisResult;
@@ -15,6 +16,7 @@ interface ResultCardProps {
   reported: boolean;
   reportError: string | null;
   onReport: () => Promise<boolean>;
+  onOpenSandbox?: (url: string) => void;
 }
 
 const VERDICT_TEXT_CLASS: Record<Verdict, string> = {
@@ -31,6 +33,29 @@ const VERDICT_MARK_CLASS: Record<Verdict, string> = {
     'bg-[#dc2626]/15 text-[#7f1d1d] underline decoration-[#dc2626]/70 underline-offset-4',
 };
 
+const THREAT_TYPE_LABELS: Record<Language, Record<string, string>> = {
+  ar: {
+    otp_credential_theft: 'سرقة رمز التحقق أو بيانات سرية',
+    fake_authority_impersonation: 'انتحال جهة رسمية أو علامة معروفة',
+    suspicious_link: 'رابط مشبوه',
+    financial_fraud: 'احتيال مالي أو تحويل أموال',
+    urgency_pressure: 'ضغط زمني واستعجال',
+    fake_offer_prize: 'إغراء بجائزة أو عرض وهمي',
+    social_engineering: 'هندسة اجتماعية',
+    filter_evasion: 'تمويه لتجاوز الفلاتر',
+  },
+  en: {
+    otp_credential_theft: 'OTP / Credential Theft',
+    fake_authority_impersonation: 'Authority / Brand Impersonation',
+    suspicious_link: 'Suspicious Link',
+    financial_fraud: 'Financial Fraud',
+    urgency_pressure: 'Urgency & Pressure',
+    fake_offer_prize: 'Fake Prize / Offer',
+    social_engineering: 'Social Engineering',
+    filter_evasion: 'Filter Evasion',
+  },
+};
+
 export function ResultCard({
   result,
   analyzedText,
@@ -39,6 +64,7 @@ export function ResultCard({
   reported,
   reportError,
   onReport,
+  onOpenSandbox,
 }: ResultCardProps) {
   const t = i18n[lang];
   const [sharing, setSharing] = useState(false);
@@ -47,7 +73,10 @@ export function ResultCard({
   const verdictLabel = t.result.verdicts[result.verdict];
   const categoryLabel = t.categories[result.category] ?? t.categories.other;
   const segments = splitTextByHighlights(analyzedText, result.highlights);
-  const steps = t.result.steps[result.verdict];
+  const steps =
+    result.recommended_actions && result.recommended_actions.length > 0
+      ? result.recommended_actions.map((a) => (lang === 'ar' ? a.ar : a.en))
+      : t.result.steps[result.verdict];
 
   const handleShare = async () => {
     if (sharing) return;
@@ -224,6 +253,106 @@ export function ResultCard({
         </div>
       ) : null}
 
+      {/* Extracted Suspicious Segments (grouped per unique sentence) */}
+      {result.suspicious_segments && result.suspicious_segments.length > 0 ? (() => {
+        const grouped = new Map<
+          string,
+          { text: string; severity: string; labels: string[]; reasons: string[] }
+        >();
+        const rank: Record<string, number> = { critical: 4, high: 3, medium: 2, low: 1 };
+        for (const seg of result.suspicious_segments) {
+          const existing = grouped.get(seg.text);
+          const label = THREAT_TYPE_LABELS[lang][seg.threat_type] ?? seg.threat_type;
+          const reason = lang === 'ar' ? seg.reason_ar : seg.reason_en;
+          if (!existing) {
+            grouped.set(seg.text, {
+              text: seg.text,
+              severity: seg.severity,
+              labels: [label],
+              reasons: [reason],
+            });
+          } else {
+            if ((rank[seg.severity] ?? 0) > (rank[existing.severity] ?? 0)) {
+              existing.severity = seg.severity;
+            }
+            if (!existing.labels.includes(label)) existing.labels.push(label);
+            if (!existing.reasons.includes(reason)) existing.reasons.push(reason);
+          }
+        }
+        const uniqueSegments = Array.from(grouped.values());
+        return (
+          <div
+            className="mt-8 border-t border-black/10 pt-6 text-start"
+            data-testid="suspicious-segments"
+          >
+            <h3 className="text-base font-medium text-black">
+              {t.result.suspiciousSegmentsTitle}
+            </h3>
+            <ul className="mt-3 space-y-2.5">
+              {uniqueSegments.map((seg, idx) => (
+                <li
+                  key={idx}
+                  className="rounded-xl border border-black/10 bg-[#f7f7f5] p-3.5 text-sm"
+                >
+                  <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
+                    <span
+                      className={`font-medium ${
+                        seg.severity === 'critical' || seg.severity === 'high'
+                          ? 'text-[#dc2626]'
+                          : 'text-[#d97706]'
+                      }`}
+                    >
+                      {seg.labels.join(' · ')}
+                    </span>
+                    <span className="font-mono text-[11px] text-black/55">{seg.severity}</span>
+                  </div>
+                  <p className="mt-1.5 font-medium text-black">“{seg.text}”</p>
+                  <p className="mt-1 text-xs leading-relaxed text-black/70">
+                    {seg.reasons.join(' · ')}
+                  </p>
+                </li>
+              ))}
+            </ul>
+          </div>
+        );
+      })() : null}
+
+      {/* Links Requiring Separate Verification */}
+      {result.links_requiring_verification && result.links_requiring_verification.length > 0 ? (
+        <div
+          className="mt-8 border-t border-black/10 pt-6 text-start"
+          data-testid="links-verification"
+        >
+          <h3 className="text-base font-medium text-black">{t.result.linksVerifyTitle}</h3>
+          <ul className="mt-3 space-y-2">
+            {result.links_requiring_verification.map((link) => (
+              <li
+                key={link.defanged_url}
+                className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-black/10 bg-[#f7f7f5] px-4 py-3 text-xs"
+              >
+                <div className="min-w-0 flex-1">
+                  <code className="block truncate font-mono font-medium text-black" dir="ltr">
+                    {link.defanged_url}
+                  </code>
+                  <p className="mt-1 text-black/70">
+                    {lang === 'ar' ? link.reason_ar : link.reason_en}
+                  </p>
+                </div>
+                {onOpenSandbox ? (
+                  <button
+                    type="button"
+                    onClick={() => onOpenSandbox(link.url)}
+                    className="inline-flex min-h-8 shrink-0 items-center whitespace-nowrap rounded-full border border-black/15 bg-white px-3 py-1 text-xs font-medium text-black transition-colors hover:bg-black hover:text-white"
+                  >
+                    {t.result.openSandboxButton}
+                  </button>
+                ) : null}
+              </li>
+            ))}
+          </ul>
+        </div>
+      ) : null}
+
       {/* Python URL Forensics X-Ray */}
       {result.url_forensics && result.url_forensics.length > 0 ? (
         <div className="mt-8 border-t border-black/10 pt-6 text-start" data-testid="result-url-forensics">
@@ -234,6 +363,7 @@ export function ResultCard({
                 key={forensics.original_url}
                 forensics={forensics}
                 lang={lang}
+                onOpenSandbox={onOpenSandbox}
               />
             ))}
           </div>
@@ -300,6 +430,13 @@ export function ResultCard({
           ))}
         </ol>
       </div>
+
+      {/* Evidence, Limitations & Timestamp */}
+      {result.evidence_bundle ? (
+        <div className="mt-8">
+          <EvidenceBundlePanel bundle={result.evidence_bundle} lang={lang} hideEvidenceList />
+        </div>
+      ) : null}
     </section>
   );
 }

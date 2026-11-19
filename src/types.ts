@@ -21,6 +21,110 @@ export interface AnalysisReason {
   match: string;
 }
 
+export type UrlClassification = 'malicious' | 'suspicious' | 'no_known_threat' | 'unknown';
+export type RiskLevel = 'critical' | 'high' | 'medium' | 'low' | 'minimal';
+export type EvidenceStrength = 'strong' | 'moderate' | 'weak' | 'insufficient';
+export type ThreatSourceStatus = 'hit' | 'clean' | 'not_configured' | 'unavailable' | 'error';
+
+export interface EvidenceItem {
+  id: string;
+  category: string;
+  severity: 'critical' | 'high' | 'medium' | 'low' | 'info' | 'safe';
+  title_ar: string;
+  title_en: string;
+  detail_ar: string;
+  detail_en: string;
+  source: string;
+  timestamp: string;
+  observed_value: string;
+}
+
+export interface SourceConflict {
+  topic_ar: string;
+  topic_en: string;
+  source_a: string;
+  result_a: string;
+  source_b: string;
+  result_b: string;
+}
+
+export interface LimitationItem {
+  code: string;
+  ar: string;
+  en: string;
+}
+
+export interface ConfidenceAssessment {
+  calibrated: boolean;
+  evidence_strength: EvidenceStrength;
+  calibrated_probability: number | null;
+  detection_ratio: string | null;
+  explanation_ar: string;
+  explanation_en: string;
+}
+
+export interface EvidenceBundle {
+  scan_timestamp: string;
+  risk_level: RiskLevel;
+  evidence: EvidenceItem[];
+  conflicts: SourceConflict[];
+  limitations: LimitationItem[];
+  confidence: ConfidenceAssessment;
+}
+
+export interface ThreatSourceResult {
+  source_id: string;
+  source_name: string;
+  status: ThreatSourceStatus;
+  verdict_detail_ar: string;
+  verdict_detail_en: string;
+  checked_at: string;
+  requires_api_key: boolean;
+  env_var: string | null;
+  detection_ratio: string | null;
+  categories: string[];
+}
+
+export interface RdapInfo {
+  available: boolean;
+  domain: string;
+  registered_at?: string | null;
+  age_days: number | null;
+  registrar?: string | null;
+  error?: string | null;
+}
+
+export interface DnsRecordsInfo {
+  available: boolean;
+  a: string[];
+  mx: string[];
+  txt: string[];
+  has_spf: boolean;
+  error: string | null;
+}
+
+export interface RecommendedAction {
+  ar: string;
+  en: string;
+}
+
+export interface SuspiciousSegment {
+  text: string;
+  threat_type: string;
+  severity: string;
+  reason_ar: string;
+  reason_en: string;
+}
+
+export interface LinkVerificationItem {
+  url: string;
+  defanged_url: string;
+  static_classification: UrlClassification;
+  needs_separate_intel_check: boolean;
+  reason_ar: string;
+  reason_en: string;
+}
+
 export interface UrlForensicFlag {
   severity: 'high' | 'medium' | 'low' | 'safe';
   title_ar: string;
@@ -44,6 +148,9 @@ export interface UrlForensics {
   is_https: boolean;
   has_punycode: boolean;
   has_non_ascii: boolean;
+  is_mixed_script_homograph?: boolean;
+  scripts_detected?: string[];
+  homograph_skeleton?: string;
   has_at_symbol: boolean;
   subdomain_depth: number;
   tracking_params_removed: string[];
@@ -51,8 +158,10 @@ export interface UrlForensics {
   matched_brand: string | null;
   is_official_brand: boolean;
   forensic_score: number;
+  classification?: UrlClassification;
   verdict: Verdict;
   flags: UrlForensicFlag[];
+  evidence_bundle?: EvidenceBundle;
 }
 
 export interface LiveUrlProbeResult {
@@ -62,6 +171,8 @@ export interface LiveUrlProbeResult {
     ips: string[];
     error: string | null;
   };
+  dns_records?: DnsRecordsInfo;
+  rdap?: RdapInfo;
   tls: {
     available: boolean;
     valid: boolean;
@@ -78,17 +189,36 @@ export interface LiveUrlProbeResult {
   }>;
   final_url: string;
   final_forensics?: UrlForensics | null;
+  threat_intel?: ThreatSourceResult[];
+  classification?: UrlClassification;
+  evidence_bundle?: EvidenceBundle;
+  recommended_actions?: RecommendedAction[];
+  scan_timestamp?: string;
 }
 
 export interface AnalysisResult {
   score: number;
   verdict: Verdict;
+  risk_level?: RiskLevel;
   category: ScamCategory;
+  threat_types?: string[];
   reasons: AnalysisReason[];
   highlights: string[];
+  suspicious_segments?: SuspiciousSegment[];
+  links_requiring_verification?: LinkVerificationItem[];
+  recommended_actions?: RecommendedAction[];
+  auxiliary_llm?: {
+    used: boolean;
+    status: string;
+    cue_detected?: boolean;
+    summary_ar: string;
+    summary_en: string;
+  };
   fingerprint: string;
   urls: string[];
   url_forensics?: UrlForensics[];
+  evidence_bundle?: EvidenceBundle;
+  scan_timestamp?: string;
 }
 
 export interface BatchAnalysisItem {
@@ -178,16 +308,46 @@ export interface PlagiarismMatch {
   sample: string;
 }
 
+export type AiTextClassification = 'human_leaning' | 'ai_leaning' | 'inconclusive';
+
+export interface AiDetectionResult {
+  language: 'ar' | 'en';
+  word_count: number;
+  sentence_count: number;
+  classification: AiTextClassification;
+  headline_ar: string;
+  headline_en: string;
+  is_probabilistic_only: boolean;
+  calibrated_ai_probability: number | null;
+  model_oof_brier: number;
+  metrics: {
+    perplexity_proxy: number;
+    cross_entropy_human_bits: number;
+    cross_entropy_ai_bits: number;
+    lm_log_ratio: number;
+    burstiness_cv: number;
+    adjacent_sentence_shift: number;
+    root_ttr: number;
+    hapax_ratio: number;
+    bigram_repetition: number;
+    starter_uniformity: number;
+    discourse_marker_rate: number;
+    punctuation_entropy: number;
+  };
+  evidence_bundle: EvidenceBundle;
+  scan_timestamp: string;
+}
+
 export interface AcademicAnalysisResult {
   word_count: number;
   sentence_count: number;
   lexical_richness: number;
   burstiness: number;
-  ai_probability: number;
+  ai_probability: number | null;
   plagiarism_pct: number;
   originality_score: number;
   verdict: AcademicVerdict;
-  matched_ai_phrases: string[];
+  matched_ai_phrases?: string[];
   plagiarism_matches: PlagiarismMatch[];
   behavior: {
     status: BehaviorStatus;
@@ -195,6 +355,7 @@ export interface AcademicAnalysisResult {
     paste_ratio: number;
   };
   signals: AcademicSignal[];
+  ai_detection?: AiDetectionResult;
   eligible_for_certificate: boolean;
 }
 
@@ -284,5 +445,76 @@ export interface SaasTenantsResponse {
     total_savings_usd: number;
   };
 }
+
+export interface UrlSandboxAction {
+  id: string;
+  severity: 'high' | 'medium' | 'low' | 'safe';
+  observed: boolean;
+  title_ar: string;
+  title_en: string;
+  detail_ar: string;
+  detail_en: string;
+}
+
+export interface UrlSandboxNetworkTrace {
+  dns_resolved: boolean;
+  dns_ips: string[];
+  dns_error: string | null;
+  tls: {
+    available: boolean;
+    valid: boolean;
+    issuer?: string;
+    days_remaining?: number | null;
+    error?: string;
+  };
+  redirects: Array<{
+    url: string;
+    status: number;
+  }>;
+  final_url: string;
+  http_status: number | null;
+  content_type: string | null;
+  server: string | null;
+  cookies_attempted: number;
+  download_filename: string | null;
+}
+
+export interface UrlSandboxDomTelemetry {
+  page_title: string;
+  visible_text_preview: string;
+  forms_count: number;
+  password_inputs: number;
+  sensitive_inputs: string[];
+  form_actions_defanged: string[];
+  cross_domain_form: boolean;
+  scripts_count: number;
+  external_script_hosts: string[];
+  obfuscated_js_hits: number;
+  js_redirect_detected: boolean;
+  exfil_webhook_detected: boolean;
+  keylogger_or_clipboard: boolean;
+  iframes_count: number;
+  hidden_iframes_count: number;
+  meta_refresh_target: string | null;
+}
+
+export interface UrlSandboxResult {
+  input_url: string;
+  defanged_url: string;
+  execution_mode: 'live_captured' | 'simulated_offline' | 'blocked_ssrf' | 'blocked_unsafe_scheme';
+  sandbox_score: number;
+  verdict: Verdict;
+  forensics: UrlForensics;
+  network_trace: UrlSandboxNetworkTrace;
+  dom_telemetry: UrlSandboxDomTelemetry;
+  what_it_tries_to_do: UrlSandboxAction[];
+  safety_guarantees: {
+    js_executed: boolean;
+    cookies_stored: boolean;
+    files_written: boolean;
+    ssrf_protected: boolean;
+  };
+}
+
 
 
