@@ -1,5 +1,5 @@
 import express from 'express';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
@@ -8,6 +8,35 @@ import { fileURLToPath } from 'node:url';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const BRIDGE_PATH = path.join(__dirname, 'backend', 'bridge.py');
 const PORT = Number(process.env.PORT ?? 3000);
+let cachedPythonCommand: { command: string; args: string[] } | undefined;
+
+function getPythonCommand(): { command: string; args: string[] } {
+  if (cachedPythonCommand) return cachedPythonCommand;
+  const candidates = [
+    ...(process.env.PYTHON ? [{ command: process.env.PYTHON, args: [] }] : []),
+    ...(process.platform === 'win32'
+      ? [
+          { command: 'python', args: [] },
+          { command: 'py', args: ['-3'] },
+        ]
+      : [
+          { command: 'python3', args: [] },
+          { command: 'python', args: [] },
+        ]),
+  ];
+
+  for (const candidate of candidates) {
+    const result = spawnSync(candidate.command, [...candidate.args, '--version'], {
+      stdio: 'ignore',
+    });
+    if (!result.error && result.status === 0) {
+      cachedPythonCommand = candidate;
+      return candidate;
+    }
+  }
+
+  throw new Error('Python was not found. Set the PYTHON environment variable to its executable.');
+}
 
 function getClientIp(req: express.Request): string {
   return req.ip || req.socket.remoteAddress || 'unknown';
@@ -20,7 +49,8 @@ function logSafeError(label: string, err: unknown): void {
 
 function runPythonBridge<T>(payload: Record<string, unknown>): Promise<T> {
   return new Promise((resolve, reject) => {
-    const child = spawn('python3', [BRIDGE_PATH], {
+    const python = getPythonCommand();
+    const child = spawn(python.command, [...python.args, BRIDGE_PATH], {
       cwd: __dirname,
       stdio: ['pipe', 'pipe', 'pipe'],
     });
@@ -655,7 +685,7 @@ async function createApp() {
   }
 
   httpServer.listen(PORT, '0.0.0.0', () => {
-    console.log(`Kashf server listening on http://0.0.0.0:${PORT}`);
+    console.log(`Kashf server listening on http://localhost:${PORT}`);
   });
 }
 

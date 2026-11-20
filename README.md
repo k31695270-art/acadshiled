@@ -48,8 +48,8 @@ npm run dev
 
 - **Python backend & security test suite**:
   ```bash
-  python3 backend/test_analyzer.py
-  python3 backend/test_stage6_dev_console.py
+  python backend/test_analyzer.py
+  python backend/test_stage6_dev_console.py
   ```
 - **Frontend utility tests**:
   ```bash
