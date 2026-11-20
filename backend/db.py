@@ -36,13 +36,16 @@ def get_db_path() -> str:
 
 
 def get_connection(db_path: str | None = None) -> sqlite3.Connection:
-    conn = sqlite3.connect(db_path or get_db_path())
+    conn = sqlite3.connect(db_path or get_db_path(), timeout=15.0)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=5000")
+    conn.execute("PRAGMA foreign_keys=ON")
     return conn
 
 
 def init_db(db_path: str | None = None) -> None:
-    """Create the reports table and timestamp index if they do not exist."""
+    """Create core tables and indexes if they do not exist."""
     with get_connection(db_path) as conn:
         conn.execute(
             """
@@ -56,7 +59,62 @@ def init_db(db_path: str | None = None) -> None:
             """
         )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_reports_ts ON reports(ts)")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS rate_limits (
+                key TEXT NOT NULL,
+                ts REAL NOT NULL
+            )
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_rate_limits_key_ts ON rate_limits(key, ts)")
         conn.commit()
+
+
+def check_rate_limit(
+    key: str,
+    max_requests: int = 30,
+    window_seconds: float = 60.0,
+    now: float | None = None,
+    db_path: str | None = None,
+) -> bool:
+    """Sliding-window persistent rate limiter in SQLite. Returns True if allowed."""
+    init_db(db_path)
+    clean_key = (key or "unknown").strip()[:128] or "unknown"
+    ts_now = now if now is not None else time.time()
+    cutoff = ts_now - window_seconds
+
+    conn = get_connection(db_path)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+            "DELETE FROM rate_limits WHERE key = ? AND ts < ?",
+            (clean_key, cutoff),
+        )
+        row = conn.execute(
+            "SELECT COUNT(*) AS cnt FROM rate_limits WHERE key = ? AND ts >= ?",
+            (clean_key, cutoff),
+        ).fetchone()
+        count = int(row["cnt"]) if row else 0
+        if count >= max_requests:
+            conn.commit()
+            return False
+
+        conn.execute(
+            "INSERT INTO rate_limits (key, ts) VALUES (?, ?)",
+            (clean_key, ts_now),
+        )
+        conn.execute(
+            "DELETE FROM rate_limits WHERE ts < ?",
+            (ts_now - (window_seconds * 2.0),),
+        )
+        conn.commit()
+        return True
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 def save_report(
@@ -76,13 +134,16 @@ def save_report(
         raise ValueError("fingerprint is required")
 
     cutoff = ts_now - DEDUP_WINDOW_SECONDS
-    with get_connection(db_path) as conn:
+    conn = get_connection(db_path)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
         existing = conn.execute(
             "SELECT id FROM reports WHERE fingerprint = ? AND ts >= ? LIMIT 1",
             (clean_fp, cutoff),
         ).fetchone()
 
         if existing is not None:
+            conn.commit()
             return {"ok": True, "deduplicated": True}
 
         conn.execute(
@@ -90,6 +151,11 @@ def save_report(
             (clean_fp, clean_category, clean_score, ts_now),
         )
         conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
     return {"ok": True, "deduplicated": False}
 
 

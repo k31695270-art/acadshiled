@@ -213,7 +213,7 @@ def _run_optional_gemini_auxiliary(text: str, timeout: float = 3.5) -> dict[str,
 
     endpoint = (
         "https://generativelanguage.googleapis.com/v1beta/models/"
-        f"gemini-2.5-flash:generateContent?key={api_key}"
+        "gemini-2.5-flash:generateContent"
     )
     prompt = (
         "Analyze if this message shows social engineering or BEC/phishing cues. "
@@ -230,7 +230,10 @@ def _run_optional_gemini_auxiliary(text: str, timeout: float = 3.5) -> dict[str,
         endpoint,
         data=body,
         method="POST",
-        headers={"Content-Type": "application/json"},
+        headers={
+            "Content-Type": "application/json",
+            "x-goog-api-key": api_key,
+        },
     )
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -270,6 +273,17 @@ def analyze_message(
     urls = extract_urls(raw_text, url)
     norm_text, index_map = normalize_arabic_with_map(raw_text)
     sentences = _split_sentences(raw_text)
+
+    try:
+        from dev_console import get_runtime_settings
+
+        runtime_settings = get_runtime_settings()
+    except Exception:
+        runtime_settings = {
+            "suspicious_threshold": 30,
+            "dangerous_threshold": 65,
+            "enable_auxiliary_llm": False,
+        }
 
     reasons: list[Reason] = []
     highlights: list[str] = []
@@ -349,6 +363,22 @@ def analyze_message(
 
     for uf in url_forensics:
         raw_url = uf["original_url"]
+        if uf.get("custom_blocklisted") and "custom_domain_blocklist" not in url_rule_flags:
+            url_rule_flags.add("custom_domain_blocklist")
+            has_risky_url = True
+            add_reason(
+                "custom_domain_blocklist",
+                55,
+                f"نطاق محظور في قائمة المطورين ({uf['host']})",
+                f"Administrator-blocklisted domain ({uf['host']})",
+                "تم إدراج هذا النطاق في قائمة الحظر الخاصة عبر لوحة تحكم المطورين.",
+                "This domain is explicitly blocked by platform administrators.",
+                raw_url,
+                "phishing_bank",
+                "suspicious_link",
+                severity="critical",
+                source="dev_domain_rules",
+            )
         if uf["matched_brand"] and not uf["is_official_brand"] and "brand_impersonation" not in url_rule_flags:
             url_rule_flags.add("brand_impersonation")
             has_risky_url = True
@@ -391,6 +421,22 @@ def analyze_message(
                 "Homograph spoofing or Punycode domain",
                 "النطاق يستخدم أحرفاً غير قياسية لخداع القارئ.",
                 "Domain uses Punycode or mixed-script characters to spoof legitimate text.",
+                raw_url,
+                "phishing_bank",
+                "suspicious_link",
+                severity="high",
+                source="url_static_forensics",
+            )
+        if uf["suspicious_params"] and "?" in raw_url and re.search(r"https?://", raw_url.split("?", 1)[1], re.IGNORECASE) and "open_redirect_lure" not in url_rule_flags:
+            url_rule_flags.add("open_redirect_lure")
+            has_risky_url = True
+            add_reason(
+                "open_redirect_lure",
+                25,
+                f"إعادة توجيه مفتوحة نحو وجهة خارجية ({', '.join(uf['suspicious_params'][:2])})",
+                f"Open-redirect parameter targeting external URL ({', '.join(uf['suspicious_params'][:2])})",
+                "يحتوي الرابط على معامل تحويل ينقل المستخدم خفية إلى وجهة خارجية غير موثوقة.",
+                "URL embeds a redirect query parameter pointing to an untrusted external destination.",
                 raw_url,
                 "phishing_bank",
                 "suspicious_link",
@@ -461,7 +507,11 @@ def analyze_message(
                 source="url_static_forensics",
             )
 
-    all_official_urls = bool(url_forensics) and all(uf["is_official_brand"] for uf in url_forensics)
+    all_official_urls = bool(url_forensics) and all(
+        (uf["is_official_brand"] or uf.get("is_official_institution") or uf.get("custom_allowlisted"))
+        and not uf.get("custom_blocklisted")
+        for uf in url_forensics
+    )
 
     # --- 2. Context Signals (avoid triggering on benign words in isolation) ---
     action_lure_phrases = [
@@ -515,7 +565,21 @@ def analyze_message(
     has_benign_context = bool(_match_phrases(raw_text, norm_text, index_map, benign_context_phrases))
 
     # --- 3. Text Threat Rules (Context-Sensitive) ---
-    # A. Sensitive Credential / OTP Theft (+35) — always strong risk (MSA + Iraqi dialect + English)
+    # A. Sensitive Credential / OTP / Secret Theft (+35) — with explicit no-share safety-advisory guard
+    no_share_advisory_phrases = [
+        "لا تشارك هذا الرمز",
+        "لا تشارك الرمز",
+        "عدم مشاركه الرمز",
+        "do not share this code",
+        "never share this code",
+        "do not share your code",
+    ]
+    has_no_share_guard = bool(
+        _match_phrases(raw_text, norm_text, index_map, no_share_advisory_phrases)
+        and not urls
+        and not action_match
+    )
+
     sensitive_phrases = [
         "otp",
         "cvv",
@@ -524,6 +588,8 @@ def analyze_message(
         "كود التحقق",
         "رمز التاكيد",
         "كود التفعيل",
+        "دزيت رمز الـ 6 ارقام",
+        "رمز الـ 6 ارقام",
         "دزلي الرمز",
         "دز الرمز",
         "دز الكود",
@@ -537,7 +603,13 @@ def analyze_message(
         "معلومات البطاقه",
         "تاريخ الانتهاء",
         "بيانات الدخول",
+        "ملف .env",
+        "مفتاح api",
         "verification code",
+        "whatsapp verification code",
+        "send me the code",
+        "upload your .env",
+        "api key",
         "password",
         "passcode",
         "card number",
@@ -545,16 +617,20 @@ def analyze_message(
         "one time password",
         "login credentials",
     ]
-    sensitive_match = _match_phrases(raw_text, norm_text, index_map, sensitive_phrases)
+    sensitive_match = (
+        None
+        if has_no_share_guard
+        else _match_phrases(raw_text, norm_text, index_map, sensitive_phrases)
+    )
     has_sensitive = bool(sensitive_match)
     if sensitive_match:
         add_reason(
             "sensitive_data",
             35,
-            "طلب رموز تحقق أو كلمات مرور أو بيانات بطاقة حساسة",
-            "Request for OTP, password, or payment credentials",
-            "المصارف والجهات الرسمية لا تطلب أبداً إرسال رمز OTP أو كلمة المرور أو بيانات البطاقة.",
-            "Banks and legitimate services never ask users to share OTPs, passwords, or CVV codes.",
+            "طلب رموز تحقق أو كلمات مرور أو بيانات بطاقة/مفاتيح سرية",
+            "Request for OTP, password, secret keys, or payment credentials",
+            "المصارف والجهات الرسمية والأصدقاء الموثوقون لا يطلبون أبداً إرسال رمز OTP أو كلمة المرور أو مفاتيح API.",
+            "Legitimate services never ask users to share OTPs, passwords, CVV codes, or .env/API secrets.",
             sensitive_match,
             "otp_theft",
             "otp_credential_theft",
@@ -565,9 +641,11 @@ def analyze_message(
     transfer_phrases = [
         "تحويل مبلغ",
         "حول مبلغ",
+        "حول رصيد",
         "حول لي",
         "ارسال مبلغ",
         "دفع رسوم",
+        "رسوم نشر عاجله",
         "بطاقه هدايا",
         "بطاقات هدايا",
         "كرت شحن",
@@ -576,15 +654,19 @@ def analyze_message(
         "حواله ماليه",
         "غيرنا حساب التحويل",
         "تغيير رقم الحساب البنكي",
+        "تحديث بيانات الفاتوره",
         "transfer money",
         "wire transfer",
+        "wire funds",
         "send money",
+        "urgent publication fee",
         "gift card",
         "gift cards",
         "itunes card",
         "steam card",
         "routing changed",
         "updated bank account",
+        "updated invoice",
     ]
     transfer_match = _match_phrases(raw_text, norm_text, index_map, transfer_phrases)
     if transfer_match:
@@ -606,6 +688,10 @@ def analyze_message(
         "سيتم ايقاف حسابك",
         "سيتم تعليق حسابك",
         "سيتم حظر حسابك",
+        "تم تجميد حسابك",
+        "تم تجميد محفظتك",
+        "تجميد محفظتك",
+        "ايقاف محفظتك",
         "حسابك راح ينسد",
         "حسابك سينغلق",
         "اخر تحذير",
@@ -797,13 +883,37 @@ def analyze_message(
             severity="high",
         )
 
-    # G. Subtle Social Engineering / Authority Impersonation / Quiet Credential Sync (+25)
+    # G. Subtle Social Engineering / OAuth Consent Phishing / Authority Impersonation (+25-35)
+    oauth_phrases = [
+        "صلاحيه قراءه وارسال",
+        "منح تطبيق المساعد صلاحيه",
+        "permission to read and send",
+        "read and send your gmail",
+        "granting our assistant app permission",
+    ]
+    oauth_match = _match_phrases(raw_text, norm_text, index_map, oauth_phrases)
+    if oauth_match and not all_official_urls:
+        add_reason(
+            "oauth_consent_phishing",
+            35,
+            "تصيّد تفويضات OAuth يطلب صلاحية قراءة وإرسال بريدك",
+            "OAuth consent phishing requesting mailbox read/send permissions",
+            "تطلب بعض الهجمات تفويض تطبيق خارجي لقراءة وإرسال بريدك بدلاً من سرقة كلمة المرور مباشرة.",
+            "Consent phishing tricks victims into granting untrusted third-party apps full read/send access.",
+            oauth_match,
+            "phishing_bank",
+            "social_engineering",
+            severity="high",
+        )
+
     subtle_se_phrases = [
         "الدعم التقني",
         "فريق تقنيه المعلومات",
         "عدم مزامنه بريدك",
+        "مزامنه بريدك",
         "مزامنه الحساب",
         "تفعيل البوابه البديله",
+        "البوابه البديله",
         "استمرار خدمتك",
         "اعاده التحقق من هويتك",
         "تحديث البوابه",
@@ -817,6 +927,16 @@ def analyze_message(
         "re-validate your profile",
         "vendor payment details",
         "audit review",
+        "updated invoice",
+        "new settlement account",
+        "settlement account",
+        "updated bank account",
+        "routing changed",
+        "new bank details",
+        "غيرنا حساب التحويل",
+        "تغيير رقم الحساب البنكي",
+        "تحديث بيانات الفاتوره",
+        "الحساب الجديد",
     ]
     authority_phrases = [
         "المصرف",
@@ -849,7 +969,7 @@ def analyze_message(
     subtle_match = _match_phrases(raw_text, norm_text, index_map, subtle_se_phrases)
     authority_match = _match_phrases(raw_text, norm_text, index_map, authority_phrases)
 
-    if subtle_match and (urls or has_action_or_link or bool(transfer_match)) and not all_official_urls:
+    if subtle_match and (urls or has_action_or_link or bool(transfer_match)) and not all_official_urls and not has_no_share_guard:
         add_reason(
             "subtle_social_engineering",
             30,
@@ -915,16 +1035,19 @@ def analyze_message(
     raw_score = sum(r["points"] for r in reasons)
 
     # Benign institutional context dampener if no sensitive credential request & no malicious URL
-    if has_benign_context and not has_sensitive and not has_risky_url and not transfer_match:
+    if has_benign_context and not has_sensitive and not has_risky_url and not transfer_match and not oauth_match:
         raw_score = max(0, raw_score - 20)
-    elif not urls and not has_sensitive and not has_urgency and not transfer_match and not subtle_match:
+    elif not urls and not has_sensitive and not has_urgency and not transfer_match and not subtle_match and not oauth_match:
         raw_score = max(0, raw_score - 10)
 
     final_score = max(0, min(100, raw_score))
 
-    if final_score <= 29:
+    susp_threshold = int(runtime_settings.get("suspicious_threshold", 30))
+    dang_threshold = int(runtime_settings.get("dangerous_threshold", 65))
+
+    if final_score < susp_threshold:
         verdict = "safe"
-    elif final_score <= 64:
+    elif final_score < dang_threshold:
         verdict = "suspicious"
     else:
         verdict = "dangerous"
@@ -1024,9 +1147,10 @@ def analyze_message(
             }
         )
 
+    effective_aux_llm = bool(use_auxiliary_llm or runtime_settings.get("enable_auxiliary_llm", False))
     auxiliary_llm = (
         _run_optional_gemini_auxiliary(raw_text)
-        if use_auxiliary_llm
+        if effective_aux_llm
         else {
             "used": False,
             "status": "skipped",

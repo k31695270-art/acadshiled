@@ -196,6 +196,10 @@ export function AcademicShield({ lang, onCertificateIssued }: AcademicShieldProp
           originality_score: result.originality_score,
         }),
       });
+      if (res.status === 429) {
+        setCertError(t.hero.rateLimitError);
+        return;
+      }
       if (!res.ok) {
         setCertError(t.hero.networkError);
         return;
@@ -322,6 +326,7 @@ export function AcademicShield({ lang, onCertificateIssued }: AcademicShieldProp
               </span>
             </div>
           </div>
+          <p className="mt-1.5 text-[11px] text-black/55">{t.academic.telemetryAdvisory}</p>
         </div>
 
         <div className="mt-3">

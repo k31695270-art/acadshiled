@@ -35,10 +35,35 @@ BUILTIN_CORPUS: list[dict[str, str]] = [
 
 SECRET_PATTERNS: list[tuple[str, str, str, re.Pattern[str]]] = [
     (
+        "private_key",
+        "مفتاح تشفير خاص مكشوف (Private Key PEM/SSH)",
+        "Exposed Private Key Material (PEM / SSH)",
+        re.compile(r"-----BEGIN (?:RSA |OPENSSH |EC |DSA |ENCRYPTED )?PRIVATE KEY-----"),
+    ),
+    (
         "api_key",
         "مفتاح برمجي أو سر وصول مكشوف (API Key / Token)",
         "Exposed API Key or Access Token",
-        re.compile(r"\b(?:AIza[0-9A-Za-z\-_]{20,}|sk-[A-Za-z0-9]{20,}|ghp_[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{16})\b"),
+        re.compile(
+            r"\b(?:AIza[0-9A-Za-z\-_]{20,}|sk-[A-Za-z0-9_-]{20,}|ghp_[A-Za-z0-9]{20,}|"
+            r"AKIA[0-9A-Z]{16}|xox[baprs]-[0-9A-Za-z-]{10,}|sk_live_[0-9A-Za-z]{16,}|hf_[A-Za-z0-9]{20,})\b"
+        ),
+    ),
+    (
+        "env_secret",
+        "بيانات اعتماد أو متغير بيئة سري (.env Secret / Password)",
+        "Exposed Environment Secret / Credential Assignment",
+        re.compile(
+            r"\b(?:SECRET_KEY|API_KEY|ACCESS_KEY|AUTH_TOKEN|DB_PASS(?:WORD)?|DATABASE_URL|"
+            r"PRIVATE_KEY|CLIENT_SECRET|PASSWORD)\s*=\s*['\"]?[^\s'\"]{6,}['\"]?",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "bearer_token",
+        "رمز تفويض وصول مكشوف (Bearer Token)",
+        "Exposed HTTP Bearer Authorization Token",
+        re.compile(r"\bBearer\s+[A-Za-z0-9\-._~+/=]{16,}\b"),
     ),
     (
         "jwt_token",
@@ -144,19 +169,23 @@ def analyze_academic_text(
         inter = doc_norm_shingles.intersection(ref_shingles)
         if inter:
             overlap_pct = min(100, round((len(inter) / len(doc_norm_shingles)) * 100))
+            union_count = len(doc_norm_shingles.union(ref_shingles))
+            jaccard_pct = min(100, round((len(inter) / max(1, union_count)) * 100))
             if overlap_pct > max_overlap_pct:
                 max_overlap_pct = overlap_pct
             if overlap_pct >= 5:
-                sample_phrase = " ".join(next(iter(inter)))
+                ordered_phrases = sorted((" ".join(sh) for sh in inter))
                 plagiarism_matches.append(
                     {
                         "source": src["source"],
                         "overlap_pct": overlap_pct,
-                        "sample": sample_phrase,
+                        "jaccard_pct": jaccard_pct,
+                        "sample": ordered_phrases[0],
+                        "samples": ordered_phrases[:3],
                     }
                 )
 
-    # Behavioral Typing Biometrics evaluation (kept separate from text stylometry)
+    # Behavioral Typing Biometrics evaluation (kept separate from text stylometry; advisory only)
     behavior_status = "not_captured"
     behavior_score = 100
     paste_ratio = 0.0
@@ -185,8 +214,8 @@ def analyze_academic_text(
     ai_probability = round(cal_prob * 100) if cal_prob is not None else None
     plagiarism_pct = max(0, min(100, max_overlap_pct))
 
-    # Originality reflects reference overlap + calibrated AI alignment (when calibrated)
-    effective_ai_pct = ai_probability if ai_probability is not None else 50
+    # Originality reflects verified overlap + calibrated AI likelihood (never penalize inconclusive short texts with a fake 50%)
+    effective_ai_pct = ai_probability if ai_probability is not None else 0
     originality_score = max(0, min(100, round(100 - (plagiarism_pct * 0.65 + effective_ai_pct * 0.35))))
 
     if plagiarism_pct >= 30 or ai_res["classification"] == "ai_leaning":
@@ -240,6 +269,14 @@ def analyze_academic_text(
     root_ttr = metrics["root_ttr"]
     richness_norm = min(1.0, round(root_ttr / 8.5, 2))
 
+    ai_res["evidence_bundle"]["limitations"].append(
+        {
+            "code": "offline_plagiarism_scope",
+            "ar": "فحص الاستلال يقارن النص فقط مع المرجع المرفق وثلاث وثائق عينة محلية (لا يفحص الإنترنت أو قواعد الجامعات الخارجية).",
+            "en": "Plagiarism 4-gram shingling compares only against the attached reference and 3 built-in sample documents (not external web databases).",
+        }
+    )
+
     return {
         "word_count": word_count,
         "sentence_count": sentence_count,
@@ -266,6 +303,14 @@ def scan_dlp_content(text: str) -> dict[str, Any]:
     raw = (text or "")[:20000]
     findings: list[dict[str, str]] = []
     seen_masked: set[str] = set()
+    high_severity_rules = {
+        "private_key",
+        "api_key",
+        "env_secret",
+        "bearer_token",
+        "jwt_token",
+        "payment_card",
+    }
 
     for rule_id, title_ar, title_en, pattern in SECRET_PATTERNS:
         for match in pattern.finditer(raw):
@@ -285,7 +330,7 @@ def scan_dlp_content(text: str) -> dict[str, Any]:
                     "title_ar": title_ar,
                     "title_en": title_en,
                     "masked_value": masked,
-                    "severity": "high" if rule_id in {"api_key", "jwt_token", "payment_card"} else "medium",
+                    "severity": "high" if rule_id in high_severity_rules else "medium",
                 }
             )
 

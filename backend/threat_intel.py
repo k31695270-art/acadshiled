@@ -17,6 +17,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from typing import Any, Literal, TypedDict
 
@@ -170,6 +171,19 @@ def check_google_safe_browsing(url: str, timeout: float = 4.0) -> ThreatSourceRe
             "categories": [],
         }
     except urllib.error.HTTPError as err:
+        if err.code == 429:
+            return {
+                "source_id": "google_safe_browsing",
+                "source_name": "Google Safe Browsing v4",
+                "status": "unavailable",
+                "verdict_detail_ar": "تجاوز حد الاستعلامات لـ Google Safe Browsing (HTTP 429) — حاول لاحقاً.",
+                "verdict_detail_en": "Google Safe Browsing rate limit reached (HTTP 429).",
+                "checked_at": checked_at,
+                "requires_api_key": True,
+                "env_var": "GOOGLE_SAFE_BROWSING_API_KEY",
+                "detection_ratio": None,
+                "categories": [],
+            }
         return {
             "source_id": "google_safe_browsing",
             "source_name": "Google Safe Browsing v4",
@@ -275,6 +289,19 @@ def check_virustotal(url: str, timeout: float = 4.0) -> ThreatSourceResult:
                 "detection_ratio": None,
                 "categories": [],
             }
+        if err.code == 429:
+            return {
+                "source_id": "virustotal",
+                "source_name": "VirusTotal API v3",
+                "status": "unavailable",
+                "verdict_detail_ar": "تجاوز حد الطلبات المجانية لـ VirusTotal (HTTP 429) — انتظر دقيقة.",
+                "verdict_detail_en": "VirusTotal rate limit reached (HTTP 429).",
+                "checked_at": checked_at,
+                "requires_api_key": True,
+                "env_var": "VIRUSTOTAL_API_KEY",
+                "detection_ratio": None,
+                "categories": [],
+            }
         return {
             "source_id": "virustotal",
             "source_name": "VirusTotal API v3",
@@ -373,6 +400,19 @@ def check_urlhaus(url: str, timeout: float = 4.0) -> ThreatSourceResult:
                 "detection_ratio": None,
                 "categories": [],
             }
+        if err.code == 429:
+            return {
+                "source_id": "urlhaus",
+                "source_name": "URLhaus (abuse.ch)",
+                "status": "unavailable",
+                "verdict_detail_ar": "تجاوز حد الاستعلامات المؤقت لـ URLhaus (HTTP 429).",
+                "verdict_detail_en": "URLhaus rate limit reached (HTTP 429).",
+                "checked_at": checked_at,
+                "requires_api_key": False,
+                "env_var": "URLHAUS_AUTH_KEY",
+                "detection_ratio": None,
+                "categories": [],
+            }
         return {
             "source_id": "urlhaus",
             "source_name": "URLhaus (abuse.ch)",
@@ -428,7 +468,7 @@ def check_openphish(url: str, timeout: float = 4.0) -> ThreatSourceResult:
                 _OPENPHISH_CACHE["hosts"] = parsed_hosts
                 _OPENPHISH_CACHE["error"] = None
             except Exception as exc:
-                _OPENPHISH_CACHE["error"] = str(exc)
+                _OPENPHISH_CACHE["error"] = type(exc).__name__
 
         urls_set = set(_OPENPHISH_CACHE.get("urls", set()))
         hosts_set = set(_OPENPHISH_CACHE.get("hosts", set()))
@@ -722,10 +762,13 @@ def query_all_threat_intel(url: str, host: str, timeout: float = 4.0) -> list[Th
             ]
         ]
 
-    return [
-        check_google_safe_browsing(url, timeout=timeout),
-        check_virustotal(url, timeout=timeout),
-        check_urlhaus(url, timeout=timeout),
-        check_openphish(url, timeout=timeout),
-        check_phishtank(url, timeout=timeout),
+    checks = [
+        lambda: check_google_safe_browsing(url, timeout=timeout),
+        lambda: check_virustotal(url, timeout=timeout),
+        lambda: check_urlhaus(url, timeout=timeout),
+        lambda: check_openphish(url, timeout=timeout),
+        lambda: check_phishtank(url, timeout=timeout),
     ]
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        futures = [executor.submit(fn) for fn in checks]
+        return [fut.result() for fut in futures]

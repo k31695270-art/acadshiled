@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { Award, CheckCircle2 } from 'lucide-react';
 import type { Language, QuizScenario, QuizVerifyResult } from '../types';
 import { i18n } from '../i18n';
@@ -26,11 +26,13 @@ export function PhishingQuiz({ lang }: PhishingQuizProps) {
   const t = i18n[lang];
   const [scenarios, setScenarios] = useState<QuizScenario[]>([]);
   const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState<string | null>(null);
   const [currentIndex, setCurrentIndex] = useState(0);
   const [correctCount, setCorrectCount] = useState(0);
   const [streak, setStreak] = useState(0);
   const [unlockedBadges, setUnlockedBadges] = useState<BadgeId[]>(() => loadSavedBadges());
   const [submitting, setSubmitting] = useState(false);
+  const [submitError, setSubmitError] = useState<string | null>(null);
   const [feedback, setFeedback] = useState<QuizVerifyResult | null>(null);
   const [finished, setFinished] = useState(false);
 
@@ -49,32 +51,38 @@ export function PhishingQuiz({ lang }: PhishingQuizProps) {
     });
   };
 
-  useEffect(() => {
-    let active = true;
-    const loadQuiz = async () => {
-      setLoading(true);
-      try {
-        const res = await fetch('/api/quiz');
-        if (!res.ok) return;
-        const data = (await res.json()) as { scenarios?: QuizScenario[] };
-        if (active && Array.isArray(data.scenarios)) {
-          setScenarios(data.scenarios);
-        }
-      } finally {
-        if (active) setLoading(false);
+  const loadQuiz = useCallback(async () => {
+    setLoading(true);
+    setLoadError(null);
+    try {
+      const res = await fetch('/api/quiz');
+      if (!res.ok) {
+        setLoadError(t.hero.networkError);
+        return;
       }
-    };
+      const data = (await res.json()) as { scenarios?: QuizScenario[] };
+      if (Array.isArray(data.scenarios)) {
+        setScenarios(data.scenarios);
+      } else {
+        setLoadError(t.hero.networkError);
+      }
+    } catch {
+      setLoadError(t.hero.networkError);
+    } finally {
+      setLoading(false);
+    }
+  }, [t.hero.networkError]);
+
+  useEffect(() => {
     void loadQuiz();
-    return () => {
-      active = false;
-    };
-  }, []);
+  }, [loadQuiz]);
 
   const current = scenarios[currentIndex];
 
   const handleAnswer = async (userSaysScam: boolean) => {
     if (!current || submitting || feedback) return;
     setSubmitting(true);
+    setSubmitError(null);
     try {
       const res = await fetch('/api/quiz/verify', {
         method: 'POST',
@@ -85,7 +93,14 @@ export function PhishingQuiz({ lang }: PhishingQuizProps) {
           lang,
         }),
       });
-      if (!res.ok) return;
+      if (res.status === 429) {
+        setSubmitError(t.hero.rateLimitError);
+        return;
+      }
+      if (!res.ok) {
+        setSubmitError(t.hero.networkError);
+        return;
+      }
       const result = (await res.json()) as QuizVerifyResult;
       setFeedback(result);
       if (result.correct) {
@@ -98,6 +113,8 @@ export function PhishingQuiz({ lang }: PhishingQuizProps) {
       } else {
         setStreak(0);
       }
+    } catch {
+      setSubmitError(t.hero.networkError);
     } finally {
       setSubmitting(false);
     }
@@ -105,6 +122,7 @@ export function PhishingQuiz({ lang }: PhishingQuizProps) {
 
   const handleNext = () => {
     setFeedback(null);
+    setSubmitError(null);
     if (currentIndex + 1 >= scenarios.length) {
       setFinished(true);
       const total = scenarios.length;
@@ -125,6 +143,7 @@ export function PhishingQuiz({ lang }: PhishingQuizProps) {
     setCorrectCount(0);
     setStreak(0);
     setFeedback(null);
+    setSubmitError(null);
     setFinished(false);
   };
 
@@ -167,6 +186,19 @@ export function PhishingQuiz({ lang }: PhishingQuizProps) {
       <div className="mt-6 rounded-2xl border border-black/10 bg-white p-5 sm:p-6">
         {loading ? (
           <div className="h-36 animate-pulse rounded-xl bg-black/[0.04]" />
+        ) : loadError ? (
+          <div className="flex flex-wrap items-center justify-between gap-4 rounded-xl border border-[#dc2626]/20 bg-[#dc2626]/5 p-4">
+            <p className="text-sm font-medium text-[#dc2626]" role="alert">
+              {loadError}
+            </p>
+            <button
+              type="button"
+              onClick={() => void loadQuiz()}
+              className="inline-flex min-h-9 items-center justify-center rounded-full border border-black/15 bg-white px-4 py-1.5 text-xs font-medium text-black transition-colors hover:bg-black hover:text-white"
+            >
+              {t.hero.retryButton}
+            </button>
+          </div>
         ) : finished ? (
           <div className="py-4 text-start" data-testid="quiz-completed">
             <h3 className="text-xl font-medium text-black">{t.quiz.completedTitle}</h3>
@@ -195,23 +227,30 @@ export function PhishingQuiz({ lang }: PhishingQuizProps) {
             </blockquote>
 
             {!feedback ? (
-              <div className="mt-5 flex flex-wrap items-center gap-3">
-                <button
-                  type="button"
-                  disabled={submitting}
-                  onClick={() => void handleAnswer(true)}
-                  className="inline-flex min-h-11 items-center justify-center whitespace-nowrap rounded-full bg-black px-6 py-2 text-sm font-medium text-white transition-opacity hover:opacity-85 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-black disabled:opacity-60"
-                >
-                  {t.quiz.scamButton}
-                </button>
-                <button
-                  type="button"
-                  disabled={submitting}
-                  onClick={() => void handleAnswer(false)}
-                  className="inline-flex min-h-11 items-center justify-center whitespace-nowrap rounded-full border border-black/15 bg-white px-6 py-2 text-sm font-medium text-black transition-colors hover:bg-black hover:text-white focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-black disabled:opacity-60"
-                >
-                  {t.quiz.safeButton}
-                </button>
+              <div>
+                <div className="mt-5 flex flex-wrap items-center gap-3">
+                  <button
+                    type="button"
+                    disabled={submitting}
+                    onClick={() => void handleAnswer(true)}
+                    className="inline-flex min-h-11 items-center justify-center whitespace-nowrap rounded-full bg-black px-6 py-2 text-sm font-medium text-white transition-opacity hover:opacity-85 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-black disabled:opacity-60"
+                  >
+                    {t.quiz.scamButton}
+                  </button>
+                  <button
+                    type="button"
+                    disabled={submitting}
+                    onClick={() => void handleAnswer(false)}
+                    className="inline-flex min-h-11 items-center justify-center whitespace-nowrap rounded-full border border-black/15 bg-white px-6 py-2 text-sm font-medium text-black transition-colors hover:bg-black hover:text-white focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-black disabled:opacity-60"
+                  >
+                    {t.quiz.safeButton}
+                  </button>
+                </div>
+                {submitError ? (
+                  <p className="mt-3 text-xs font-medium text-[#dc2626]" role="alert">
+                    {submitError}
+                  </p>
+                ) : null}
               </div>
             ) : (
               <div

@@ -29,6 +29,8 @@ export function DlpScanner({ lang }: DlpScannerProps) {
       const text = await file.text();
       setContent(text.slice(0, 20000));
       setError(null);
+    } catch {
+      setError(t.hero.networkError);
     } finally {
       e.target.value = '';
     }

@@ -1,4 +1,4 @@
-"""SQLite-backed SHA-256 Proof-of-Authenticity Hash Chain for academic research certificates."""
+"""SQLite-backed Tamper-Evident SHA-256 Local Hash Chain for academic research certificates."""
 
 from __future__ import annotations
 
@@ -80,7 +80,9 @@ def issue_certificate(
     doc_hash = hashlib.sha256((text or "").strip().encode("utf-8")).hexdigest()
     ts = time.time()
 
-    with get_connection(db_path) as conn:
+    conn = get_connection(db_path)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
         last_row = conn.execute(
             "SELECT block_index, block_hash FROM ledger_blocks ORDER BY block_index DESC LIMIT 1"
         ).fetchone()
@@ -122,6 +124,11 @@ def issue_certificate(
             "SELECT * FROM ledger_blocks WHERE cert_id = ?",
             (cert_id,),
         ).fetchone()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
     return _row_to_dict(inserted)
 

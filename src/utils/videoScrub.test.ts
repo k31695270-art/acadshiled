@@ -1,8 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  MAX_RENDER_HEIGHT,
+  MAX_RENDER_WIDTH,
   TOTAL_ROBOT_FRAMES,
+  clampPointerDelta,
   computeCoverCropRect,
+  computeRenderBufferSize,
   computeScrubFrame,
   computeScrubTime,
   stepSmoothValue,
@@ -23,9 +27,9 @@ test('computeScrubFrame maps horizontal cursor delta across 97 frames with clamp
 });
 
 test('stepSmoothValue exponentially approaches target independent of frame rate', () => {
-  const mid = stepSmoothValue(0, 50, 1 / 60, 14);
-  assert.ok(mid > 5 && mid < 50);
-  assert.equal(stepSmoothValue(10, 10.00001, 1 / 60, 14), 10.00001);
+  const mid = stepSmoothValue(0, 50, 1 / 60, 18);
+  assert.ok(mid > 10 && mid < 50);
+  assert.equal(stepSmoothValue(10, 10.00001, 1 / 60, 18), 10.00001);
 });
 
 test('computeCoverCropRect respects focalXRatio when source is wider than viewport', () => {
@@ -35,4 +39,20 @@ test('computeCoverCropRect respects focalXRatio when source is wider than viewpo
   assert.equal(leftCrop.sh, 724);
   assert.equal(leftCrop.sw, 362);
   assert.ok(leftCrop.sx < rightCrop.sx);
+});
+
+test('clampPointerDelta limits extreme jumps while keeping normal deltas intact', () => {
+  assert.equal(clampPointerDelta(45), 45);
+  assert.equal(clampPointerDelta(600), 220);
+  assert.equal(clampPointerDelta(-600), -220);
+  assert.equal(clampPointerDelta(Number.NaN), 0);
+});
+
+test('computeRenderBufferSize scales cleanly up to 2x DPR and caps at 4K bounds', () => {
+  assert.deepEqual(computeRenderBufferSize(1440, 900, 2), {
+    width: 2880,
+    height: 1800,
+  });
+  const capped = computeRenderBufferSize(2560, 1440, 2);
+  assert.ok(capped.width <= MAX_RENDER_WIDTH && capped.height <= MAX_RENDER_HEIGHT);
 });

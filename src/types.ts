@@ -305,7 +305,9 @@ export interface AcademicSignal {
 export interface PlagiarismMatch {
   source: string;
   overlap_pct: number;
+  jaccard_pct?: number;
   sample: string;
+  samples?: string[];
 }
 
 export type AiTextClassification = 'human_leaning' | 'ai_leaning' | 'inconclusive';
@@ -515,6 +517,3 @@ export interface UrlSandboxResult {
     ssrf_protected: boolean;
   };
 }
-
-
-

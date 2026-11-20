@@ -1,10 +1,11 @@
-"""Pure-Python Isolated Safe URL Sandbox.
+"""Pure-Python Isolated Safe URL Sandbox (Static HTTP/HTML Payload Inspector).
 
-Detonates suspicious URLs inside a strict server-side Python environment without executing
-JavaScript, storing cookies, writing files to disk, or reaching internal/private networks.
-Inspects live HTTP headers, redirect chains, and static HTML/script payloads (forms, OTP/card
-harvesters, hidden iframes, meta-refresh, JS redirects, obfuscation, Telegram webhooks) and
-falls back to predictive behavioral simulation when a domain is offline or unreachable.
+Inspects suspicious URLs inside a strict server-side Python environment without executing
+JavaScript, running a full browser/OS VM, storing cookies, writing files to disk, or reaching
+internal/private networks (pinned-IP SSRF guard). Inspects live HTTP headers, redirect chains,
+and static HTML/script payloads (forms, OTP/card harvesters, hidden iframes, meta-refresh,
+JS redirects, obfuscation, Telegram webhooks) and falls back to predictive behavioral patterns
+when a domain is offline or unreachable.
 """
 
 from __future__ import annotations
@@ -12,19 +13,14 @@ from __future__ import annotations
 import os
 import posixpath
 import re
+import time
 import urllib.error
 import urllib.parse
-import urllib.request
 from html.parser import HTMLParser
 from typing import Any
 
-from url_inspector import (
-    _NoAutoRedirect,
-    _inspect_tls,
-    _resolve_public_host,
-    defang_url,
-    inspect_url_forensics,
-)
+import url_inspector
+from url_inspector import defang_url, inspect_url_forensics
 
 MAX_SANDBOX_BYTES = 131_072  # 128 KB hard read cap
 DANGEROUS_DOWNLOAD_EXTS = {
@@ -277,90 +273,48 @@ def detonate_url_in_sandbox(raw_url: str, timeout: float = 4.0) -> dict[str, Any
         "ssrf_protected": True,
     }
 
-    # 1. Block dangerous non-network URI schemes immediately
-    for bad_scheme in ("javascript:", "data:", "vbscript:", "file:"):
-        if lower_trimmed.startswith(bad_scheme):
-            return {
-                "input_url": trimmed,
-                "defanged_url": defang_url(trimmed),
-                "execution_mode": "blocked_unsafe_scheme",
-                "sandbox_score": 98,
-                "verdict": "dangerous",
-                "forensics": {
-                    "original_url": trimmed,
-                    "normalized_url": trimmed,
-                    "defanged_url": defang_url(trimmed),
-                    "sanitized_url": trimmed,
-                    "scheme": bad_scheme.rstrip(":"),
-                    "host": "",
-                    "punycode_decoded_host": "",
-                    "tld": "",
-                    "port": None,
-                    "path": "",
-                    "entropy": 0.0,
-                    "is_ip": False,
-                    "is_shortener": False,
-                    "is_https": False,
-                    "has_punycode": False,
-                    "has_non_ascii": False,
-                    "has_at_symbol": False,
-                    "subdomain_depth": 0,
-                    "tracking_params_removed": [],
-                    "suspicious_params": [],
-                    "matched_brand": None,
-                    "is_official_brand": False,
-                    "forensic_score": 98,
-                    "verdict": "dangerous",
-                    "flags": [],
-                },
-                "network_trace": {
-                    "dns_resolved": False,
-                    "dns_ips": [],
-                    "dns_error": f"Blocked executable scheme ({bad_scheme})",
-                    "tls": {"available": False, "valid": False},
-                    "redirects": [],
-                    "final_url": defang_url(trimmed),
-                    "http_status": None,
-                    "content_type": None,
-                    "server": None,
-                    "cookies_attempted": 0,
-                    "download_filename": None,
-                },
-                "dom_telemetry": {
-                    "page_title": "",
-                    "visible_text_preview": "",
-                    "forms_count": 0,
-                    "password_inputs": 0,
-                    "sensitive_inputs": [],
-                    "form_actions_defanged": [],
-                    "cross_domain_form": False,
-                    "scripts_count": 0,
-                    "external_script_hosts": [],
-                    "obfuscated_js_hits": 0,
-                    "js_redirect_detected": False,
-                    "exfil_webhook_detected": False,
-                    "keylogger_or_clipboard": False,
-                    "iframes_count": 0,
-                    "hidden_iframes_count": 0,
-                    "meta_refresh_target": None,
-                },
-                "what_it_tries_to_do": [
-                    {
-                        "id": "unsafe_scheme",
-                        "severity": "high",
-                        "observed": True,
-                        "title_ar": f"محاولة تنفيذ كود محلي مباشر عبر مخطط ({bad_scheme})",
-                        "title_en": f"Direct client-side code execution attempt via {bad_scheme}",
-                        "detail_ar": "لو فُتح هذا الرابط في المتصفح لحاول حقن أو تشغيل أوامر داخل الجلسة مباشرة. قام صندوق الرمل بحظره فوراً.",
-                        "detail_en": "Opening this link would attempt immediate script or local URI execution; blocked inside the sandbox.",
-                    }
-                ],
-                "safety_guarantees": safety_guarantees,
-            }
+    # 1. Block dangerous or non-HTTP(S) URI schemes immediately
+    bad_scheme = url_inspector._check_explicit_non_http_scheme(trimmed)
+    if bad_scheme:
+        scheme_forensics = inspect_url_forensics(trimmed)
+        return {
+            "input_url": trimmed,
+            "defanged_url": scheme_forensics["defanged_url"],
+            "execution_mode": "blocked_unsafe_scheme",
+            "sandbox_score": scheme_forensics["forensic_score"],
+            "verdict": "dangerous",
+            "forensics": scheme_forensics,
+            "network_trace": {
+                "dns_resolved": False,
+                "dns_ips": [],
+                "dns_error": f"Blocked unsafe scheme ({bad_scheme})",
+                "tls": {"available": False, "valid": False},
+                "redirects": [],
+                "final_url": scheme_forensics["defanged_url"],
+                "http_status": None,
+                "content_type": None,
+                "server": None,
+                "cookies_attempted": 0,
+                "download_filename": None,
+            },
+            "dom_telemetry": inspect_html_payload("", trimmed),
+            "what_it_tries_to_do": [
+                {
+                    "id": "unsafe_scheme",
+                    "severity": "high",
+                    "observed": True,
+                    "title_ar": f"محاولة استخدام مخطط غير آمن أو تنفيذي ({bad_scheme})",
+                    "title_en": f"Unsafe or executable URI scheme attempt ({bad_scheme})",
+                    "detail_ar": "لو فُتح هذا الرابط لحاول تنفيذ أوامر محلية أو استخدام بروتوكول غير HTTP(S). قام صندوق الرمل بحظره فوراً.",
+                    "detail_en": "Opening this link would attempt non-HTTP(S) execution or protocol probing; blocked inside the sandbox.",
+                }
+            ],
+            "safety_guarantees": safety_guarantees,
+        }
 
     forensics = inspect_url_forensics(trimmed)
     host = forensics["host"]
-    allowed, ips, dns_error = _resolve_public_host(host)
+    allowed, ips, dns_error = url_inspector._resolve_public_host(host)
 
     # 2. SSRF Block check
     if not allowed and dns_error and "Blocked" in dns_error:
@@ -399,7 +353,7 @@ def detonate_url_in_sandbox(raw_url: str, timeout: float = 4.0) -> dict[str, Any
             "safety_guarantees": safety_guarantees,
         }
 
-    # 3. Live isolated fetch when DNS resolves publicly
+    # 3. Live isolated fetch when DNS resolves publicly (with pinned IP & cumulative deadline)
     tls_info: dict[str, Any] = {"available": False, "valid": False}
     redirects: list[dict[str, Any]] = []
     http_status: int | None = None
@@ -409,70 +363,86 @@ def detonate_url_in_sandbox(raw_url: str, timeout: float = 4.0) -> dict[str, Any
     cookies_attempted = 0
     captured_body = ""
     live_captured = False
+    redirect_ssrf_blocked = False
+    redirect_ssrf_reason: str | None = None
 
     current_url = forensics["normalized_url"]
+    deadline = time.monotonic() + max(timeout * 2.5, 6.0)
 
     if allowed:
         port = forensics["port"] or 443
-        tls_info = _inspect_tls(host, port=port, timeout=min(timeout, 2.5))
-        opener = urllib.request.build_opener(_NoAutoRedirect())
+        tls_info = url_inspector._inspect_tls(host, port=port, timeout=min(timeout, 2.5), pinned_ip=ips[0] if ips else None)
 
         for _ in range(6):
-            parsed_curr = urllib.parse.urlparse(current_url)
-            curr_host = (parsed_curr.hostname or "").lower()
-            ok_hop, _, _ = _resolve_public_host(curr_host)
-            if not ok_hop:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.2:
+                break
+            bad_hop_scheme = url_inspector._check_explicit_non_http_scheme(current_url)
+            if bad_hop_scheme:
+                redirect_ssrf_blocked = True
+                redirect_ssrf_reason = f"Blocked unsafe redirect scheme ({bad_hop_scheme})"
                 break
 
-            req = urllib.request.Request(
-                current_url,
-                method="GET",
-                headers={
-                    "User-Agent": "Kashf-Isolated-Sandbox/1.0 (+no-js; +no-cookies)",
-                    "Accept": "text/html,application/xhtml+xml,text/plain;q=0.9,*/*;q=0.5",
-                },
-            )
+            parsed_curr = urllib.parse.urlparse(current_url)
+            curr_host = (parsed_curr.hostname or "").lower()
+            ok_hop, hop_ips, hop_err = url_inspector._resolve_public_host(curr_host)
+            if not ok_hop or not hop_ips:
+                if hop_err and "Blocked" in hop_err:
+                    redirect_ssrf_blocked = True
+                    redirect_ssrf_reason = hop_err
+                break
+
             try:
-                with opener.open(req, timeout=timeout) as resp:
-                    http_status = int(getattr(resp, "status", 200))
-                    redirects.append({"url": defang_url(current_url), "status": http_status})
-                    headers = resp.headers
-                    if headers:
-                        content_type = headers.get("Content-Type")
-                        server_hdr = headers.get("Server")
-                        content_disp = headers.get("Content-Disposition") or ""
-                        set_cookies = headers.get_all("Set-Cookie") or []
-                        cookies_attempted += len(set_cookies)
-                    raw_bytes = resp.read(MAX_SANDBOX_BYTES)
-                    if raw_bytes and (
-                        not content_type
-                        or "text" in content_type.lower()
-                        or "html" in content_type.lower()
-                        or "json" in content_type.lower()
-                        or "javascript" in content_type.lower()
-                    ):
-                        captured_body = raw_bytes.decode("utf-8", errors="replace")
-                    live_captured = True
-                    break
-            except urllib.error.HTTPError as err:
-                http_status = int(err.code)
+                status_code, headers, raw_bytes = url_inspector._pinned_http_request(
+                    current_url,
+                    pinned_ip=hop_ips[0],
+                    method="GET",
+                    timeout=min(timeout, remaining),
+                    max_bytes=MAX_SANDBOX_BYTES,
+                    headers={
+                        "User-Agent": "Kashf-Isolated-Sandbox/1.0 (+no-js; +no-cookies)",
+                        "Accept": "text/html,application/xhtml+xml,text/plain;q=0.9,*/*;q=0.5",
+                    },
+                )
+                http_status = int(status_code)
                 redirects.append({"url": defang_url(current_url), "status": http_status})
-                if err.headers:
-                    set_cookies = err.headers.get_all("Set-Cookie") or []
+                if headers:
+                    content_type = headers.get("Content-Type")
+                    server_hdr = headers.get("Server")
+                    content_disp = headers.get("Content-Disposition") or ""
+                    set_cookies = (
+                        (headers.get_all("Set-Cookie") or [])
+                        if hasattr(headers, "get_all")
+                        else ([headers["Set-Cookie"]] if headers.get("Set-Cookie") else [])
+                    )
                     cookies_attempted += len(set_cookies)
-                    content_type = err.headers.get("Content-Type")
-                    server_hdr = err.headers.get("Server")
-                    content_disp = err.headers.get("Content-Disposition") or ""
-                location = err.headers.get("Location") if err.headers else None
+
+                location = headers.get("Location") if headers else None
                 if http_status in {301, 302, 303, 307, 308} and location:
-                    current_url = urllib.parse.urljoin(current_url, location)
+                    next_url = urllib.parse.urljoin(current_url, location)
+                    bad_next = url_inspector._check_explicit_non_http_scheme(next_url)
+                    if bad_next:
+                        redirect_ssrf_blocked = True
+                        redirect_ssrf_reason = f"Blocked redirect to unsafe scheme ({bad_next})"
+                        break
+                    next_host = (urllib.parse.urlparse(next_url).hostname or "").lower()
+                    ok_next, _, next_err = url_inspector._resolve_public_host(next_host)
+                    if not ok_next:
+                        if next_err and "Blocked" in next_err:
+                            redirect_ssrf_blocked = True
+                            redirect_ssrf_reason = next_err
+                        break
+                    current_url = next_url
                     continue
-                try:
-                    err_bytes = err.read(MAX_SANDBOX_BYTES)
-                    if err_bytes:
-                        captured_body = err_bytes.decode("utf-8", errors="replace")
-                except Exception:
-                    pass
+
+                if raw_bytes and (
+                    not content_type
+                    or "text" in content_type.lower()
+                    or "html" in content_type.lower()
+                    or "json" in content_type.lower()
+                    or "javascript" in content_type.lower()
+                ):
+                    captured_body = raw_bytes.decode("utf-8", errors="replace")
                 live_captured = True
                 break
             except Exception:
@@ -673,10 +643,29 @@ def detonate_url_in_sandbox(raw_url: str, timeout: float = 4.0) -> dict[str, Any
             }
         )
 
+    if redirect_ssrf_blocked:
+        score = max(score, 94)
+        actions.insert(
+            0,
+            {
+                "id": "ssrf_redirect_blocked",
+                "severity": "high",
+                "observed": True,
+                "title_ar": "أعاد الرابط التوجيه نحو عنوان شبكة داخلي أو مخطط خطر (تم حظر التحويل)",
+                "title_en": "Attempted HTTP redirect to private/internal target or unsafe URI scheme",
+                "detail_ar": redirect_ssrf_reason or "تم اعتراض إعادة التوجيه لحماية الشبكة الداخلية.",
+                "detail_en": redirect_ssrf_reason or "Redirect intercepted by SSRF guard.",
+            },
+        )
+
     final_score = max(0, min(100, score))
     verdict = "safe" if final_score <= 29 else ("suspicious" if final_score <= 64 else "dangerous")
 
-    execution_mode = "live_captured" if live_captured else "simulated_offline"
+    execution_mode = (
+        "blocked_ssrf"
+        if redirect_ssrf_blocked
+        else ("live_captured" if live_captured else "simulated_offline")
+    )
 
     return {
         "input_url": trimmed,

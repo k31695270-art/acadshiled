@@ -1,4 +1,7 @@
-export const SCRUB_SENSITIVITY = 1.15;
+export const SCRUB_SENSITIVITY = 1.05;
+export const FRAME_SMOOTH_SPEED = 18;
+export const FOCAL_SMOOTH_SPEED = 12;
+export const MAX_POINTER_DELTA_PX = 220;
 export const TOTAL_ROBOT_FRAMES = 97;
 export const SHEET_COLS = 3;
 export const SHEET_ROWS = 3;
@@ -6,6 +9,16 @@ export const FRAMES_PER_SHEET = SHEET_COLS * SHEET_ROWS;
 export const SHEET_COUNT = Math.ceil(TOTAL_ROBOT_FRAMES / FRAMES_PER_SHEET);
 export const TILE_WIDTH = 1280;
 export const TILE_HEIGHT = 724;
+export const MAX_RENDER_WIDTH = 3840;
+export const MAX_RENDER_HEIGHT = 2160;
+
+export function clampPointerDelta(
+  deltaX: number,
+  maxDelta: number = MAX_POINTER_DELTA_PX,
+): number {
+  if (!Number.isFinite(deltaX)) return 0;
+  return Math.max(-maxDelta, Math.min(maxDelta, deltaX));
+}
 
 export function computeScrubTime(
   currentTargetTime: number,
@@ -42,7 +55,7 @@ export function stepSmoothValue(
   current: number,
   target: number,
   dtSeconds: number,
-  speed: number = 14,
+  speed: number = FRAME_SMOOTH_SPEED,
 ): number {
   if (Math.abs(target - current) < 1e-4) {
     return target;
@@ -50,6 +63,25 @@ export function stepSmoothValue(
   const clampedDt = Math.max(0, Math.min(0.1, dtSeconds));
   const factor = 1 - Math.exp(-speed * clampedDt);
   return current + (target - current) * factor;
+}
+
+export function computeRenderBufferSize(
+  viewportWidth: number,
+  viewportHeight: number,
+  devicePixelRatio: number,
+): { width: number; height: number } {
+  const safeW = Math.max(1, viewportWidth);
+  const safeH = Math.max(1, viewportHeight);
+  const dpr = Math.max(1, Math.min(devicePixelRatio || 1, 2));
+  let width = Math.round(safeW * dpr);
+  let height = Math.round(safeH * dpr);
+
+  if (width > MAX_RENDER_WIDTH || height > MAX_RENDER_HEIGHT) {
+    const scale = Math.min(MAX_RENDER_WIDTH / width, MAX_RENDER_HEIGHT / height);
+    width = Math.max(1, Math.round(width * scale));
+    height = Math.max(1, Math.round(height * scale));
+  }
+  return { width, height };
 }
 
 export interface CoverCropRect {

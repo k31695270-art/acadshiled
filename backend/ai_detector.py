@@ -390,6 +390,11 @@ def analyze_ai_vs_human(text: str) -> dict[str, Any]:
             "مقياس الانتروبيا والحيرة المعروض هو تقريب إحصائي لنماذج n-gram المحلية وليس حيرة نموذج لغوي عصبي ضخم.",
             "Reported cross-entropy / perplexity proxy is computed via local smoothed n-gram models rather than a neural LLM.",
         ),
+        make_limitation(
+            "small_calibration_corpus",
+            "تمت معايرة النموذج الإحصائي على مجموعة تدريب محلية محدودة الحجم (32 نصاً مرجعياً) وقد تختلف دقته باختلاف التخصصات الأكاديمية.",
+            "Statistical classifier is calibrated on a small domain-specific reference corpus (32 passages) and accuracy varies across disciplines.",
+        ),
     ]
 
     # Build transparent linguistic evidence items

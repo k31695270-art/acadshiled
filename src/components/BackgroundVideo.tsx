@@ -1,5 +1,7 @@
 import { useEffect, useRef } from 'react';
 import {
+  FOCAL_SMOOTH_SPEED,
+  FRAME_SMOOTH_SPEED,
   FRAMES_PER_SHEET,
   SCRUB_SENSITIVITY,
   SHEET_COLS,
@@ -7,7 +9,9 @@ import {
   TILE_HEIGHT,
   TILE_WIDTH,
   TOTAL_ROBOT_FRAMES,
+  clampPointerDelta,
   computeCoverCropRect,
+  computeRenderBufferSize,
   computeScrubFrame,
   stepSmoothValue,
 } from '../utils/videoScrub';
@@ -18,6 +22,7 @@ interface BackgroundVideoProps {
 
 export function BackgroundVideo({ lang }: BackgroundVideoProps) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const ctxRef = useRef<CanvasRenderingContext2D | null>(null);
   const framesRef = useRef<Array<ImageBitmap | null>>(
     Array.from({ length: TOTAL_ROBOT_FRAMES }, () => null),
   );
@@ -44,9 +49,11 @@ export function BackgroundVideo({ lang }: BackgroundVideoProps) {
   const drawCurrentFrame = (force: boolean = false) => {
     const canvas = canvasRef.current;
     if (!canvas) return;
-    const ctx = canvas.getContext('2d', { alpha: false });
+    const ctx = ctxRef.current ?? canvas.getContext('2d', { alpha: false });
     if (!ctx) return;
+    ctxRef.current = ctx;
 
+    // Strictly render ONE single crisp frame at a time (never blend two frames)
     const frameIdx = Math.max(
       0,
       Math.min(TOTAL_ROBOT_FRAMES - 1, Math.round(currentFrameRef.current)),
@@ -73,6 +80,8 @@ export function BackgroundVideo({ lang }: BackgroundVideoProps) {
       0.5,
     );
 
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = 'high';
     ctx.drawImage(
       bitmap,
       crop.sx,
@@ -110,13 +119,13 @@ export function BackgroundVideo({ lang }: BackgroundVideoProps) {
         currentFrameRef.current,
         targetFrameRef.current,
         dt,
-        16,
+        FRAME_SMOOTH_SPEED,
       );
       const nextFocalX = stepSmoothValue(
         currentFocalXRef.current,
         targetFocalXRef.current,
         dt,
-        10,
+        FOCAL_SMOOTH_SPEED,
       );
 
       currentFrameRef.current = nextFrame;
@@ -154,11 +163,15 @@ export function BackgroundVideo({ lang }: BackgroundVideoProps) {
 
     const canvas = canvasRef.current;
     if (!canvas) return;
+    ctxRef.current = canvas.getContext('2d', { alpha: false });
+    canvas.dataset.renderer = '2d-single';
 
     const syncCanvasSize = () => {
-      const dpr = Math.min(window.devicePixelRatio || 1, 1.5);
-      const width = Math.max(1, Math.round(window.innerWidth * dpr));
-      const height = Math.max(1, Math.round(window.innerHeight * dpr));
+      const { width, height } = computeRenderBufferSize(
+        window.innerWidth,
+        window.innerHeight,
+        window.devicePixelRatio || 1,
+      );
       const nextFocal = computeTargetFocalX(lang);
       targetFocalXRef.current = nextFocal;
       currentFocalXRef.current = nextFocal;
@@ -235,7 +248,13 @@ export function BackgroundVideo({ lang }: BackgroundVideoProps) {
           await Promise.all(slicePromises);
           sheetBitmap.close();
           if (!cancelled) {
-            drawCurrentFrame(true);
+            const visibleIdx = Math.max(
+              0,
+              Math.min(TOTAL_ROBOT_FRAMES - 1, Math.round(currentFrameRef.current)),
+            );
+            if (visibleIdx >= startFrame && visibleIdx < endFrame) {
+              drawCurrentFrame(true);
+            }
           }
         }),
       );
@@ -250,8 +269,9 @@ export function BackgroundVideo({ lang }: BackgroundVideoProps) {
         return;
       }
 
-      const delta = clientX - prevXRef.current;
+      const rawDelta = clientX - prevXRef.current;
       prevXRef.current = clientX;
+      const delta = clampPointerDelta(rawDelta);
       if (delta === 0) return;
 
       targetFrameRef.current = computeScrubFrame(
@@ -262,6 +282,10 @@ export function BackgroundVideo({ lang }: BackgroundVideoProps) {
         SCRUB_SENSITIVITY,
       );
       scheduleLoop();
+    };
+
+    const resetPointerAnchor = () => {
+      prevXRef.current = null;
     };
 
     const onMouseMove = (event: MouseEvent) => handlePointerMove(event.clientX);
@@ -279,6 +303,8 @@ export function BackgroundVideo({ lang }: BackgroundVideoProps) {
     window.addEventListener('mousemove', onMouseMove, { passive: true });
     window.addEventListener('touchstart', onTouchStart, { passive: true });
     window.addEventListener('touchmove', onTouchMove, { passive: true });
+    document.addEventListener('mouseleave', resetPointerAnchor, { passive: true });
+    window.addEventListener('blur', resetPointerAnchor, { passive: true });
 
     return () => {
       cancelled = true;
@@ -290,7 +316,10 @@ export function BackgroundVideo({ lang }: BackgroundVideoProps) {
       window.removeEventListener('mousemove', onMouseMove);
       window.removeEventListener('touchstart', onTouchStart);
       window.removeEventListener('touchmove', onTouchMove);
+      document.removeEventListener('mouseleave', resetPointerAnchor);
+      window.removeEventListener('blur', resetPointerAnchor);
 
+      ctxRef.current = null;
       posterRef.current?.close();
       posterRef.current = null;
       framesRef.current.forEach((bmp) => bmp?.close());

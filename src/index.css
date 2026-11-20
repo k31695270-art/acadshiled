@@ -8,6 +8,9 @@
 html {
   font-family: var(--font-body);
   scroll-behavior: smooth;
+  cursor: url('/assets/aistudio/ArrowFarCursor_8fea32ed.png') 63 62, auto;
+  cursor: -webkit-image-set(url('/assets/aistudio/ArrowFarCursor_8fea32ed.png') 2x) 31 31, auto;
+  cursor: image-set(url('/assets/aistudio/ArrowFarCursor_8fea32ed.png') 2x) 31 31, auto;
 }
 
 body {
@@ -15,6 +18,40 @@ body {
   margin: 0;
   min-height: 100svh;
   color: #000000;
+  cursor: url('/assets/aistudio/ArrowFarCursor_8fea32ed.png') 63 62, auto;
+  cursor: -webkit-image-set(url('/assets/aistudio/ArrowFarCursor_8fea32ed.png') 2x) 31 31, auto;
+  cursor: image-set(url('/assets/aistudio/ArrowFarCursor_8fea32ed.png') 2x) 31 31, auto;
+}
+
+a[href],
+button:not(:disabled),
+[role="button"]:not([aria-disabled="true"]),
+[role="tab"],
+summary,
+select,
+label[for],
+input[type="checkbox"],
+input[type="radio"],
+input[type="submit"],
+input[type="button"],
+.cursor-pointer {
+  cursor: url('/assets/aistudio/ArrowCursor_3642c4c4.png') 63 59, pointer !important;
+  cursor: -webkit-image-set(url('/assets/aistudio/ArrowCursor_3642c4c4.png') 2x) 31 30, pointer !important;
+  cursor: image-set(url('/assets/aistudio/ArrowCursor_3642c4c4.png') 2x) 31 30, pointer !important;
+}
+
+textarea,
+input[type="text"],
+input[type="url"],
+input[type="email"],
+input[type="search"],
+input[type="password"] {
+  cursor: text;
+}
+
+button:disabled,
+[aria-disabled="true"] {
+  cursor: not-allowed !important;
 }
 
 @keyframes blink {

@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import http.client
 import ipaddress
 import math
 import re
 import socket
 import ssl
+import time
 import unicodedata
 import urllib.error
 import urllib.parse
@@ -154,6 +156,9 @@ class UrlForensics(TypedDict):
     suspicious_params: list[str]
     matched_brand: str | None
     is_official_brand: bool
+    is_official_institution: bool
+    custom_blocklisted: bool
+    custom_allowlisted: bool
     forensic_score: int
     classification: UrlClassification
     verdict: str
@@ -272,74 +277,92 @@ def analyze_homograph_scripts(host: str, decoded_host: str) -> dict[str, Any]:
     }
 
 
+def _check_explicit_non_http_scheme(raw_url: str) -> str | None:
+    """Detect explicit non-HTTP(S) URI schemes without misclassifying host:port strings."""
+    trimmed = (raw_url or "").strip()
+    lower = trimmed.lower()
+    for exec_scheme in ("javascript:", "data:", "vbscript:", "file:"):
+        if lower.startswith(exec_scheme):
+            return exec_scheme
+    match = re.match(r"^([a-zA-Z][a-zA-Z0-9+.-]*):(?://|[^0-9])", trimmed)
+    if match:
+        scheme = match.group(1).lower()
+        if scheme not in {"http", "https"}:
+            return f"{scheme}:"
+    return None
+
+
 def inspect_url_forensics(raw_url: str) -> UrlForensics:
     """Run deep offline URL forensic inspection with honest 4-state classification."""
     ts = utc_now_iso()
     trimmed = (raw_url or "").strip()
-    lower_trimmed = trimmed.lower()
 
-    # Handle dangerous non-network schemes safely before urlparse port errors
-    for bad_scheme in ("javascript:", "data:", "vbscript:", "file:"):
-        if lower_trimmed.startswith(bad_scheme):
-            ev = [
-                make_evidence(
-                    evidence_id="unsafe_uri_scheme",
-                    category="technical",
-                    severity="critical",
-                    title_ar=f"مخطط رابط تنفيذي خطير ({bad_scheme})",
-                    title_en=f"Executable or local URI scheme ({bad_scheme})",
-                    detail_ar="الرابط يستخدم مخطط تنفيذ كود محلي وليس عنوان ويب آمن.",
-                    detail_en="URL uses a direct execution or local file URI scheme instead of HTTP(S).",
-                    source="url_static_forensics",
-                    observed_value=bad_scheme,
-                    timestamp=ts,
-                )
-            ]
-            bundle = build_evidence_bundle(
-                evidence=ev,
-                risk_level="critical",
-                has_authoritative_hit=True,
-                data_sufficient=True,
-                scan_timestamp=ts,
+    # Handle dangerous or unsupported non-HTTP(S) schemes safely before urlparse/normalization
+    bad_scheme = _check_explicit_non_http_scheme(trimmed)
+    if bad_scheme:
+        is_exec = bad_scheme in {"javascript:", "data:", "vbscript:", "file:"}
+        ev = [
+            make_evidence(
+                evidence_id="unsafe_uri_scheme",
+                category="technical",
+                severity="critical" if is_exec else "high",
+                title_ar=f"مخطط رابط غير آمن أو غير مدعوم ({bad_scheme})",
+                title_en=f"Unsafe or unsupported URI scheme ({bad_scheme})",
+                detail_ar="الرابط يستخدم مخططاً غير HTTP/HTTPS وقد يستهدف تنفيذ كود أو بروتوكولاً محلياً.",
+                detail_en="URL uses a non-HTTP(S) scheme instead of standard web transport.",
+                source="url_static_forensics",
+                observed_value=bad_scheme,
+                timestamp=ts,
             )
-            return {
-                "original_url": trimmed,
-                "normalized_url": trimmed,
-                "defanged_url": defang_url(trimmed),
-                "sanitized_url": trimmed,
-                "scheme": bad_scheme.rstrip(":"),
-                "host": "",
-                "punycode_decoded_host": "",
-                "tld": "",
-                "port": None,
-                "path": "",
-                "entropy": 0.0,
-                "is_ip": False,
-                "is_shortener": False,
-                "is_https": False,
-                "has_punycode": False,
-                "has_non_ascii": False,
-                "is_mixed_script_homograph": False,
-                "scripts_detected": [],
-                "homograph_skeleton": "",
-                "has_at_symbol": False,
-                "subdomain_depth": 0,
-                "tracking_params_removed": [],
-                "suspicious_params": [],
-                "matched_brand": None,
-                "is_official_brand": False,
-                "forensic_score": 98,
-                "classification": "malicious",
-                "verdict": "dangerous",
-                "flags": [
-                    {
-                        "severity": "high",
-                        "title_ar": f"مخطط تنفيذ كود مباشر ({bad_scheme})",
-                        "title_en": f"Dangerous executable scheme ({bad_scheme})",
-                    }
-                ],
-                "evidence_bundle": bundle,
-            }
+        ]
+        bundle = build_evidence_bundle(
+            evidence=ev,
+            risk_level="critical" if is_exec else "high",
+            has_authoritative_hit=is_exec,
+            data_sufficient=True,
+            scan_timestamp=ts,
+        )
+        return {
+            "original_url": trimmed,
+            "normalized_url": trimmed,
+            "defanged_url": defang_url(trimmed),
+            "sanitized_url": trimmed,
+            "scheme": bad_scheme.rstrip(":"),
+            "host": "",
+            "punycode_decoded_host": "",
+            "tld": "",
+            "port": None,
+            "path": "",
+            "entropy": 0.0,
+            "is_ip": False,
+            "is_shortener": False,
+            "is_https": False,
+            "has_punycode": False,
+            "has_non_ascii": False,
+            "is_mixed_script_homograph": False,
+            "scripts_detected": [],
+            "homograph_skeleton": "",
+            "has_at_symbol": False,
+            "subdomain_depth": 0,
+            "tracking_params_removed": [],
+            "suspicious_params": [],
+            "matched_brand": None,
+            "is_official_brand": False,
+            "is_official_institution": False,
+            "custom_blocklisted": False,
+            "custom_allowlisted": False,
+            "forensic_score": 98 if is_exec else 88,
+            "classification": "malicious",
+            "verdict": "dangerous",
+            "flags": [
+                {
+                    "severity": "high",
+                    "title_ar": f"مخطط رابط غير آمن ({bad_scheme})",
+                    "title_en": f"Unsafe URI scheme ({bad_scheme})",
+                }
+            ],
+            "evidence_bundle": bundle,
+        }
 
     has_explicit_scheme = bool(re.match(r"^https?://", trimmed, re.IGNORECASE))
     normalized = trimmed if has_explicit_scheme else f"https://{trimmed}"
@@ -396,6 +419,38 @@ def inspect_url_forensics(raw_url: str) -> UrlForensics:
         (parsed.scheme, parsed.netloc, parsed.path, parsed.params, sanitized_query, parsed.fragment)
     )
 
+    # Check Developer Console custom blocklist/allowlist rules (safe fallback if DB unavailable)
+    custom_blocklisted = False
+    custom_allowlisted = False
+    try:
+        from dev_console import get_domain_rules_map  # local import avoids circular startup
+
+        rules_map = get_domain_rules_map()
+        blocklist = rules_map.get("blocklist", set())
+        allowlist = rules_map.get("allowlist", set())
+        if host:
+            custom_blocklisted = any(host == d or host.endswith(f".{d}") for d in blocklist)
+            custom_allowlisted = any(host == d or host.endswith(f".{d}") for d in allowlist)
+    except Exception:
+        custom_blocklisted = False
+        custom_allowlisted = False
+
+    # Official Iraqi institutional domains (.gov.iq / .edu.iq) when free of deception markers
+    is_official_institution = bool(
+        host
+        and not is_ip
+        and not has_punycode
+        and not is_mixed_script
+        and not has_at_symbol
+        and not suspicious_params
+        and (
+            host == "gov.iq"
+            or host.endswith(".gov.iq")
+            or host == "edu.iq"
+            or host.endswith(".edu.iq")
+        )
+    )
+
     # Brand matching (check both raw host and homograph skeleton)
     matched_brand: str | None = None
     is_official_brand = False
@@ -408,6 +463,9 @@ def inspect_url_forensics(raw_url: str) -> UrlForensics:
                 break
         if is_official_brand:
             break
+
+    if custom_allowlisted and not is_official_brand and not custom_blocklisted:
+        is_official_brand = True
 
     if not is_official_brand and not is_ip and labels:
         skel_host = homograph_skeleton or host
@@ -452,6 +510,74 @@ def inspect_url_forensics(raw_url: str) -> UrlForensics:
     flags: list[dict[str, str]] = []
     evidence: list[EvidenceItem] = []
     score = 0
+
+    if custom_blocklisted:
+        score += 55
+        flags.append(
+            {
+                "severity": "high",
+                "title_ar": f"نطاق محظور في قائمة المطورين ({host})",
+                "title_en": f"Domain explicitly blocklisted by administrators ({host})",
+            }
+        )
+        evidence.append(
+            make_evidence(
+                evidence_id="custom_domain_blocklist",
+                category="domain_pattern",
+                severity="critical",
+                title_ar=f"النطاق مدرج في قائمة الحظر المخصصة ({host})",
+                title_en=f"Domain is in custom administrator blocklist ({host})",
+                detail_ar="تم تصنيف هذا النطاق كمحظور يدوياً عبر لوحة تحكم المطورين في منصة كشف.",
+                detail_en="This domain was explicitly blocklisted via the Kashf Developer Console.",
+                source="dev_domain_rules",
+                observed_value=host,
+                timestamp=ts,
+            )
+        )
+    elif custom_allowlisted:
+        flags.append(
+            {
+                "severity": "safe",
+                "title_ar": f"نطاق موثوق في قائمة السماح ({host})",
+                "title_en": f"Domain verified on custom allowlist ({host})",
+            }
+        )
+        evidence.append(
+            make_evidence(
+                evidence_id="custom_domain_allowlist",
+                category="domain_pattern",
+                severity="safe",
+                title_ar=f"النطاق مدرج في قائمة السماح المخصصة ({host})",
+                title_en=f"Domain verified on custom allowlist ({host})",
+                detail_ar="تم اعتماد هذا النطاق ضمن قائمة النطاقات الموثوقة عبر لوحة تحكم المطورين.",
+                detail_en="This domain is trusted in the Kashf Developer Console allowlist.",
+                source="dev_domain_rules",
+                observed_value=host,
+                timestamp=ts,
+            )
+        )
+    elif is_official_institution:
+        flags.append(
+            {
+                "severity": "safe",
+                "title_ar": f"نطاق رسمي أكاديمي/حكومي عراقي ({host})",
+                "title_en": f"Verified Iraqi institutional domain ({host})",
+            }
+        )
+        evidence.append(
+            make_evidence(
+                evidence_id="official_institution_iq",
+                category="domain_pattern",
+                severity="safe",
+                title_ar=f"يطابق امتداداً مؤسسياً عراقياً موثقاً ({tld or host})",
+                title_en=f"Matches official Iraqi .gov.iq / .edu.iq namespace",
+                detail_ar="النطاق ينتمي إلى البنية الرسمية الحكومية أو الجامعية العراقية ولا يحتوي على معاملات إعادة توجيه مشبوهة.",
+                detail_en="Domain belongs to the official Iraqi government or university namespace with clean parameters.",
+                source="url_static_forensics",
+                observed_value=host,
+                timestamp=ts,
+            )
+        )
 
     if matched_brand and not is_official_brand:
         score += 35
@@ -653,21 +779,32 @@ def inspect_url_forensics(raw_url: str) -> UrlForensics:
         )
 
     if suspicious_params:
-        score += 10
+        has_embedded_url_param = bool(re.search(r"https?://", parsed.query, re.IGNORECASE))
+        pts = 20 if has_embedded_url_param else 10
+        sev = "high" if has_embedded_url_param else "medium"
+        score += pts
         flags.append(
             {
-                "severity": "medium",
-                "title_ar": f"معاملات رابط حساسة: {', '.join(suspicious_params[:3])}",
-                "title_en": f"Sensitive URL parameters: {', '.join(suspicious_params[:3])}",
+                "severity": sev,
+                "title_ar": (
+                    f"إعادة توجيه مفتوحة أو رابط مضمّن داخل المعاملات ({', '.join(suspicious_params[:3])})"
+                    if has_embedded_url_param
+                    else f"معاملات رابط حساسة: {', '.join(suspicious_params[:3])}"
+                ),
+                "title_en": (
+                    f"Open-redirect target embedded in parameters ({', '.join(suspicious_params[:3])})"
+                    if has_embedded_url_param
+                    else f"Sensitive URL parameters: {', '.join(suspicious_params[:3])}"
+                ),
             }
         )
         evidence.append(
             make_evidence(
                 evidence_id="suspicious_query_params",
                 category="url_structure",
-                severity="medium",
-                title_ar="معاملات استعلام حساسة أو إعادة توجيه",
-                title_en="Sensitive or open-redirect query parameters",
+                severity=sev,
+                title_ar="معاملات استعلام حساسة أو إعادة توجيه مفتوحة" if has_embedded_url_param else "معاملات استعلام حساسة أو إعادة توجيه",
+                title_en="Open-redirect URL in query parameters" if has_embedded_url_param else "Sensitive or open-redirect query parameters",
                 detail_ar=", ".join(suspicious_params[:5]),
                 detail_en=", ".join(suspicious_params[:5]),
                 source="url_static_forensics",
@@ -704,13 +841,18 @@ def inspect_url_forensics(raw_url: str) -> UrlForensics:
 
     # Honest 4-state static classification (offline mode before external Threat Intel)
     high_flags = sum(1 for f in flags if f["severity"] == "high")
-    if final_score >= 60 or (matched_brand and not is_official_brand and final_score >= 45) or (is_mixed_script and high_flags >= 1 and final_score >= 45):
+    if (
+        custom_blocklisted
+        or final_score >= 60
+        or (matched_brand and not is_official_brand and final_score >= 45)
+        or (is_mixed_script and high_flags >= 1 and final_score >= 45)
+    ):
         classification: UrlClassification = "malicious"
         verdict = "dangerous"
     elif final_score >= 15:
         classification = "suspicious"
         verdict = "suspicious"
-    elif is_official_brand:
+    elif is_official_brand or custom_allowlisted or is_official_institution:
         classification = "no_known_threat"
         verdict = "safe"
     else:
@@ -740,8 +882,8 @@ def inspect_url_forensics(raw_url: str) -> UrlForensics:
         evidence=evidence,
         risk_level=risk_level,
         limitations=limitations,
-        has_authoritative_hit=False,
-        data_sufficient=bool(host) and (final_score > 0 or is_official_brand),
+        has_authoritative_hit=custom_blocklisted,
+        data_sufficient=bool(host) and (final_score > 0 or is_official_brand or is_official_institution or custom_blocklisted or custom_allowlisted),
         scan_timestamp=ts,
     )
 
@@ -771,6 +913,9 @@ def inspect_url_forensics(raw_url: str) -> UrlForensics:
         "suspicious_params": suspicious_params,
         "matched_brand": matched_brand,
         "is_official_brand": is_official_brand,
+        "is_official_institution": is_official_institution,
+        "custom_blocklisted": custom_blocklisted,
+        "custom_allowlisted": custom_allowlisted,
         "forensic_score": final_score,
         "classification": classification,
         "verdict": verdict,
@@ -779,30 +924,54 @@ def inspect_url_forensics(raw_url: str) -> UrlForensics:
     }
 
 
+_EXTRA_BLOCKED_NETS = (
+    ipaddress.ip_network("100.64.0.0/10"),   # CGNAT
+    ipaddress.ip_network("169.254.0.0/16"),  # Cloud metadata & link-local IPv4
+    ipaddress.ip_network("192.0.0.0/24"),
+    ipaddress.ip_network("198.18.0.0/15"),   # Benchmarking
+    ipaddress.ip_network("fc00::/7"),        # IPv6 Unique Local Address
+    ipaddress.ip_network("fe80::/10"),       # IPv6 link-local
+)
+
+
 def _is_public_ip(ip_str: str) -> bool:
     try:
-        ip_obj = ipaddress.ip_address(ip_str)
-        return not (
+        ip_obj = ipaddress.ip_address(ip_str.split("%", 1)[0])
+        if isinstance(ip_obj, ipaddress.IPv6Address) and ip_obj.ipv4_mapped is not None:
+            ip_obj = ip_obj.ipv4_mapped
+        if (
             ip_obj.is_private
             or ip_obj.is_loopback
             or ip_obj.is_link_local
             or ip_obj.is_multicast
             or ip_obj.is_reserved
             or ip_obj.is_unspecified
-        )
+            or not ip_obj.is_global
+        ):
+            return False
+        for net in _EXTRA_BLOCKED_NETS:
+            if ip_obj.version == net.version and ip_obj in net:
+                return False
+        return True
     except ValueError:
         return False
 
 
 def _resolve_public_host(host: str) -> tuple[bool, list[str], str | None]:
-    """Resolve host via DNS and enforce SSRF protection against private/local IPs."""
-    if not host:
+    """Resolve host via DNS and enforce SSRF protection against private/local/metadata IPs."""
+    clean_host = (host or "").strip().lower().rstrip(".")
+    if not clean_host:
         return False, [], "Invalid hostname"
-    if host in {"localhost", "127.0.0.1", "::1"} or host.endswith(".local"):
+    if (
+        clean_host in {"localhost", "127.0.0.1", "::1", "0.0.0.0", "metadata.google.internal"}
+        or clean_host.endswith(".local")
+        or clean_host.endswith(".internal")
+        or clean_host.endswith(".localhost")
+    ):
         return False, [], "Blocked local/internal host"
 
     try:
-        infos = socket.getaddrinfo(host, None, proto=socket.IPPROTO_TCP)
+        infos = socket.getaddrinfo(clean_host, None, proto=socket.IPPROTO_TCP)
     except socket.gaierror as exc:
         return False, [], f"DNS resolution failed: {exc}"
 
@@ -819,11 +988,19 @@ def _resolve_public_host(host: str) -> tuple[bool, list[str], str | None]:
     return True, ips, None
 
 
-def _inspect_tls(host: str, port: int = 443, timeout: float = 3.0) -> dict[str, Any]:
-    """Fetch TLS certificate metadata without trusting or downloading page content."""
+def _inspect_tls(
+    host: str,
+    port: int = 443,
+    timeout: float = 3.0,
+    pinned_ip: str | None = None,
+) -> dict[str, Any]:
+    """Fetch TLS certificate metadata using pinned public IP to prevent DNS rebinding."""
     ctx = ssl.create_default_context()
+    connect_target = pinned_ip or host
+    if pinned_ip and not _is_public_ip(pinned_ip):
+        return {"available": False, "valid": False, "error": "Blocked non-public TLS target"}
     try:
-        with socket.create_connection((host, port), timeout=timeout) as sock:
+        with socket.create_connection((connect_target, port), timeout=timeout) as sock:
             with ctx.wrap_socket(sock, server_hostname=host) as ssock:
                 cert = ssock.getpeercert()
                 cipher = ssock.cipher()
@@ -859,7 +1036,85 @@ def _inspect_tls(host: str, port: int = 443, timeout: float = 3.0) -> dict[str, 
     except ssl.SSLCertVerificationError as exc:
         return {"available": True, "valid": False, "error": f"Untrusted SSL: {exc.reason}"}
     except Exception as exc:
-        return {"available": False, "valid": False, "error": str(exc)}
+        return {"available": False, "valid": False, "error": type(exc).__name__}
+
+
+class _PinnedHTTPConnection(http.client.HTTPConnection):
+    """HTTP connection pinned directly to a pre-validated public IP (anti-DNS-rebinding)."""
+
+    def __init__(self, host: str, port: int, pinned_ip: str, timeout: float) -> None:
+        super().__init__(host, port=port, timeout=timeout)
+        self._pinned_ip = pinned_ip
+
+    def connect(self) -> None:
+        self.sock = socket.create_connection((self._pinned_ip, self.port), self.timeout)
+
+
+class _PinnedHTTPSConnection(http.client.HTTPSConnection):
+    """HTTPS connection pinned to a public IP with SNI/cert validation on the real hostname."""
+
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        pinned_ip: str,
+        timeout: float,
+        context: ssl.SSLContext,
+    ) -> None:
+        super().__init__(host, port=port, timeout=timeout, context=context)
+        self._pinned_ip = pinned_ip
+        self._sni_host = host
+
+    def connect(self) -> None:
+        raw_sock = socket.create_connection((self._pinned_ip, self.port), self.timeout)
+        self.sock = self._context.wrap_socket(raw_sock, server_hostname=self._sni_host)
+
+
+def _pinned_http_request(
+    url: str,
+    *,
+    pinned_ip: str,
+    method: str = "HEAD",
+    timeout: float = 3.5,
+    max_bytes: int = 0,
+    headers: dict[str, str] | None = None,
+) -> tuple[int, Any, bytes]:
+    """Perform a single SSRF-pinned HTTP(S) request without auto-following redirects."""
+    if not _is_public_ip(pinned_ip):
+        raise ValueError("Blocked non-public IP target")
+
+    parsed = urllib.parse.urlparse(url)
+    scheme = (parsed.scheme or "https").lower()
+    if scheme not in {"http", "https"}:
+        raise ValueError(f"Unsupported scheme: {scheme}")
+
+    host = parsed.hostname or ""
+    port = parsed.port or (443 if scheme == "https" else 80)
+    target = parsed.path or "/"
+    if parsed.query:
+        target = f"{target}?{parsed.query}"
+
+    req_headers = {
+        "Host": parsed.netloc,
+        "Connection": "close",
+        **(headers or {}),
+    }
+
+    conn: http.client.HTTPConnection
+    if scheme == "https":
+        ctx = ssl.create_default_context()
+        conn = _PinnedHTTPSConnection(host, port, pinned_ip, timeout, ctx)
+    else:
+        conn = _PinnedHTTPConnection(host, port, pinned_ip, timeout)
+
+    try:
+        conn.request(method.upper(), target, headers=req_headers)
+        resp = conn.getresponse()
+        status = int(resp.status)
+        body = resp.read(max_bytes) if max_bytes > 0 else b""
+        return status, resp.headers, body
+    finally:
+        conn.close()
 
 
 class _NoAutoRedirect(urllib.request.HTTPRedirectHandler):
@@ -1041,36 +1296,54 @@ def probe_url_live(
         }
 
     port = forensics["port"] or 443
-    tls_info = _inspect_tls(host, port=port, timeout=min(timeout, 3.0))
+    tls_info = _inspect_tls(host, port=port, timeout=min(timeout, 3.0), pinned_ip=ips[0] if ips else None)
 
-    # Trace up to 5 HTTP redirect hops via HEAD with SSRF check per hop
-    opener = urllib.request.build_opener(_NoAutoRedirect())
+    # Trace up to 5 HTTP redirect hops using pinned-IP connections with per-hop SSRF check
     current_url = forensics["normalized_url"]
     redirects: list[RedirectHop] = []
+    redirect_ssrf_reason: str | None = None
+    deadline = time.monotonic() + max(timeout * 2.5, 6.0)
 
     for _ in range(5):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0.2:
+            break
+        bad_hop_scheme = _check_explicit_non_http_scheme(current_url)
+        if bad_hop_scheme:
+            redirect_ssrf_reason = f"Blocked unsafe redirect scheme ({bad_hop_scheme})"
+            break
         parsed_curr = urllib.parse.urlparse(current_url)
         curr_host = (parsed_curr.hostname or "").lower()
-        ok_hop, _, _ = _resolve_public_host(curr_host)
-        if not ok_hop:
+        ok_hop, hop_ips, hop_err = _resolve_public_host(curr_host)
+        if not ok_hop or not hop_ips:
+            if hop_err and "Blocked" in hop_err:
+                redirect_ssrf_reason = hop_err
             break
 
-        req = urllib.request.Request(
-            current_url,
-            method="HEAD",
-            headers={"User-Agent": "Kashf-Security-Inspector/2.0"},
-        )
         try:
-            with opener.open(req, timeout=timeout) as resp:
-                status = getattr(resp, "status", 200)
-                redirects.append({"url": current_url, "status": int(status)})
-                break
-        except urllib.error.HTTPError as err:
-            status = int(err.code)
+            status, resp_headers, _ = _pinned_http_request(
+                current_url,
+                pinned_ip=hop_ips[0],
+                method="HEAD",
+                timeout=min(timeout, remaining),
+                max_bytes=0,
+                headers={"User-Agent": "Kashf-Security-Inspector/2.0"},
+            )
             redirects.append({"url": current_url, "status": status})
-            location = err.headers.get("Location") if err.headers else None
+            location = resp_headers.get("Location") if resp_headers else None
             if status in {301, 302, 303, 307, 308} and location:
-                current_url = urllib.parse.urljoin(current_url, location)
+                next_url = urllib.parse.urljoin(current_url, location)
+                bad_next = _check_explicit_non_http_scheme(next_url)
+                if bad_next:
+                    redirect_ssrf_reason = f"Blocked unsafe redirect target scheme ({bad_next})"
+                    break
+                next_host = (urllib.parse.urlparse(next_url).hostname or "").lower()
+                ok_next, _, next_err = _resolve_public_host(next_host)
+                if not ok_next:
+                    if next_err and "Blocked" in next_err:
+                        redirect_ssrf_reason = next_err
+                    break
+                current_url = next_url
                 continue
             break
         except Exception:
@@ -1227,30 +1500,51 @@ def probe_url_live(
             }
         )
 
-    # Strict 4-state live classification
+    if redirect_ssrf_reason:
+        evidence.append(
+            make_evidence(
+                evidence_id="ssrf_redirect_blocked",
+                category="security_guard",
+                severity="critical",
+                title_ar="تم حظر إعادة توجيه تستهدف عنواناً داخلياً أو مخططاً غير آمن (SSRF)",
+                title_en="Blocked redirect attempting SSRF or unsafe URI scheme",
+                detail_ar=redirect_ssrf_reason,
+                detail_en=redirect_ssrf_reason,
+                source="ssrf_guard",
+                observed_value=defang_url(final_url),
+                timestamp=scan_ts,
+            )
+        )
+
+    # Strict 4-state live classification (TLS alone on an unseen domain does NOT imply no_known_threat)
     has_invalid_tls = tls_info.get("available") and not tls_info.get("valid")
     is_very_young = isinstance(age_days, int) and age_days < 30
 
-    if hits or tech_score >= 60 or (forensics["matched_brand"] and not forensics["is_official_brand"] and (is_very_young or has_invalid_tls or tech_score >= 45)):
+    if (
+        redirect_ssrf_reason
+        or hits
+        or tech_score >= 60
+        or (forensics["matched_brand"] and not forensics["is_official_brand"] and (is_very_young or has_invalid_tls or tech_score >= 45))
+    ):
         classification = "malicious"
-        risk_level = "critical" if (hits or tech_score >= 70) else "high"
+        risk_level = "critical" if (redirect_ssrf_reason or hits or tech_score >= 70) else "high"
     elif tech_score >= 15 or is_very_young or has_invalid_tls or (final_forensics and final_forensics["forensic_score"] >= 15):
         classification = "suspicious"
         risk_level = "high" if (tech_score >= 45 or has_invalid_tls) else "medium"
-    elif cleans or (allowed and tls_info.get("valid")):
+    elif cleans or forensics["is_official_brand"] or forensics["is_official_institution"] or forensics["custom_allowlisted"]:
         classification = "no_known_threat"
         risk_level = "minimal"
     else:
         classification = "unknown"
         risk_level = "low"
 
-    data_sufficient = bool(hits or cleans or allowed or forensics["flags"])
+    data_sufficient = bool(redirect_ssrf_reason or hits or cleans or forensics["is_official_brand"] or forensics["is_official_institution"] or forensics["flags"])
     bundle = build_evidence_bundle(
         evidence=evidence,
         risk_level=risk_level,
         conflicts=conflicts,
         limitations=limitations,
-        has_authoritative_hit=bool(hits),
+        has_authoritative_hit=bool(hits or redirect_ssrf_reason),
         data_sufficient=data_sufficient,
         detection_ratio=vt_ratio,
         scan_timestamp=scan_ts,

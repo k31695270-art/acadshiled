@@ -121,17 +121,7 @@ def test_live_probe_conflict_and_ssrf_guard():
     ), patch.object(
         url_inspector, "_inspect_tls", return_value={"available": True, "valid": True, "issuer": "Let's Encrypt", "days_remaining": 85}
     ):
-        # Prevent actual HTTP HEAD from running by mocking opener
-        class _FakeResp:
-            status = 200
-            def __enter__(self):
-                return self
-            def __exit__(self, *args):
-                return False
-        class _FakeOpener:
-            def open(self, req, timeout=3.5):
-                return _FakeResp()
-        with patch("urllib.request.build_opener", return_value=_FakeOpener()):
+        with patch.object(url_inspector, "_pinned_http_request", return_value=(200, {}, b"")):
             probe = url_inspector.probe_url_live("https://paypa1-secure.xyz/login", include_intel=True)
             assert probe["classification"] == "malicious"
             assert probe["rdap"]["age_days"] == 5

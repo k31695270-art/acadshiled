@@ -6,3 +6,12 @@ coverage/
 *.log
 .env*
 !.env.example
+backend/*.db
+backend/*.db-wal
+backend/*.db-shm
+backend/__pycache__/
+**/__pycache__/
+*.pyc
+.playwright-cli/
+test-results/
+

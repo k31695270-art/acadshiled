@@ -142,11 +142,24 @@ def test_obfuscation_and_batch_analysis():
 
 def test_quiz_scenarios_and_verify():
     scenarios = get_quiz_scenarios()
-    assert len(scenarios) >= 5
+    assert len(scenarios) == 20, f"Expected 20 scenarios, got {len(scenarios)}"
     assert "is_scam" not in scenarios[0]
-    verdict = verify_quiz_answer("rafidain-otp", True, "ar")
-    assert verdict["correct"] is True
-    assert verdict["analysis"]["verdict"] == "dangerous"
+
+    for item in scenarios:
+        res_yes = verify_quiz_answer(item["id"], True, "ar")
+        res_no = verify_quiz_answer(item["id"], False, "en")
+        assert res_yes["correct"] != res_no["correct"]
+        expected_scam = res_yes["is_scam"]
+
+        # Verify Python analyzer scores match ground truth in both languages
+        ar_score = res_yes["analysis"]["score"]
+        en_score = res_no["analysis"]["score"]
+        if expected_scam:
+            assert ar_score >= 30, f"{item['id']} AR score too low: {ar_score}"
+            assert en_score >= 30, f"{item['id']} EN score too low: {en_score}"
+        else:
+            assert ar_score < 30, f"{item['id']} AR false positive: {ar_score}"
+            assert en_score < 30, f"{item['id']} EN false positive: {en_score}"
 
 
 def test_academic_ai_plagiarism_and_behavior():

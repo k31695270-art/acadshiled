@@ -241,7 +241,9 @@ def register_saas_tenant(
     api_prefix = f"acad_live_{digest[:12]}"
     status = "sandbox" if tier == "starter" else "active"
 
-    with get_connection(db_path) as conn:
+    conn = get_connection(db_path)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
         last_row = conn.execute(
             "SELECT COALESCE(MAX(id), 0) AS max_id FROM saas_tenants"
         ).fetchone()
@@ -272,6 +274,11 @@ def register_saas_tenant(
             ),
         )
         conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
     return list_saas_tenants(db_path=db_path)
 
